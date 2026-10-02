@@ -1,0 +1,19 @@
+api: 4
+id: dev.sakura.mijia
+name: 米家
+author: Sakura Community
+description: 扫码连接米家，选择允许桌宠查询和控制的设备与场景。
+version: 0.3.0
+min_app_version: "1.3.2"
+entry: plugin:MijiaPlugin
+enabled: false
+provides:
+  - dev.sakura.mijia
+requires:
+  - sakura.host.tools
+  - sakura.host.settings
+  - sakura.host.logging
+presentation:
+  kind: extension
+  category: connectivity
+  icon: house

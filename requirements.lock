@@ -1,0 +1,24 @@
+certifi==2026.7.22
+    # via requests
+charset-normalizer==3.5.2
+    # via requests
+colorama==0.4.6
+    # via qrcode
+idna==3.20
+    # via requests
+mijiaapi==4.4.0
+    # via -r ../Sakura-Mijia/requirements.txt
+pillow==12.3.0
+    # via mijiaapi
+pycryptodome==3.23.0
+    # via mijiaapi
+qrcode==8.2
+    # via mijiaapi
+requests==2.34.2
+    # via mijiaapi
+tzdata==2026.4
+    # via tzlocal
+tzlocal==5.4.4
+    # via mijiaapi
+urllib3==2.8.0
+    # via requests

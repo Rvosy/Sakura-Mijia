@@ -1,0 +1,8 @@
+.deps/
+.acceptance/
+.test-data/
+dist/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
