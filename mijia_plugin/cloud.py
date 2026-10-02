@@ -5,9 +5,7 @@ import json
 import logging
 import re
 import threading
-import time
 from contextlib import contextmanager
-from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote
 
@@ -26,30 +24,22 @@ _request_context = threading.local()
 
 
 @contextmanager
-def network_scope(cancel: threading.Event, seconds: float = 45):
+def network_scope(cancel: threading.Event):
     _request_context.cancel = cancel
-    _request_context.deadline = time.monotonic() + seconds
     try:
         yield
     finally:
         _request_context.cancel = None
-        _request_context.deadline = None
 
 
 class TimedSession(requests.Session):
     def request(self, method, url, **kwargs):
         cancel = getattr(_request_context, "cancel", None)
-        deadline = getattr(_request_context, "deadline", None)
         if cancel and cancel.is_set():
             raise PluginError("CANCELLED", "操作已取消。")
-        remaining = deadline - time.monotonic() if deadline else 20
-        if remaining <= 0:
-            raise requests.Timeout()
         # Upstream QR long polling explicitly requests 120 seconds. Other calls
         # have no timeout upstream, so bound them here without retrying writes.
-        requested = kwargs.get("timeout", 15)
-        read_timeout = requested if isinstance(requested, (int, float)) else 15
-        kwargs["timeout"] = (min(5, remaining), min(read_timeout, remaining))
+        kwargs.setdefault("timeout", (5, 15))
         result = super().request(method, url, **kwargs)
         if cancel and cancel.is_set():
             raise PluginError("CANCELLED", "操作已取消。")
@@ -126,32 +116,9 @@ def parse_spec(content: dict) -> dict:
                 "key": f"{siid}.{aiid}", "name": action["type"],
                 "description": translations.get(f"service:{siid:03d}:action:{aiid:03d}") or action.get("description", ""),
                 "siid": siid, "aiid": aiid,
-                "inputs": [by_id.get(i, {"unsupported": True, "piid": i}) for i in inputs],
+                "inputs": [by_id.get(i, {"piid": i}) for i in inputs],
             })
     return result
-
-
-def validate_value(prop: dict, value):
-    fmt = prop["format"]
-    valid = ((fmt == "bool" and type(value) is bool)
-             or (fmt == "string" and isinstance(value, str))
-             or (fmt.startswith(("int", "uint")) and type(value) is int)
-             or (fmt == "float" and type(value) in (int, float)))
-    if not valid:
-        raise PluginError("INVALID_VALUE", f"{prop['key']} 的值必须符合 {fmt} 类型。")
-    if type(value) in (int, float):
-        number = Decimal(str(value))
-        if not number.is_finite():
-            raise PluginError("INVALID_VALUE", "数值必须是有限数。")
-        if fmt.startswith("uint") and value < 0:
-            raise PluginError("INVALID_VALUE", "无符号整数不能为负数。")
-        bounds = prop.get("range")
-        if bounds:
-            low, high, step = map(lambda x: Decimal(str(x)), bounds)
-            if not low <= number <= high or (step > 0 and (number - low) % step != 0):
-                raise PluginError("INVALID_VALUE", f"{prop['key']} 的值超出范围或不符合步长。")
-    if prop.get("values") and not any(type(v["value"]) is type(value) and v["value"] == value for v in prop["values"]):
-        raise PluginError("INVALID_VALUE", f"{prop['key']} 的值不在设备允许的选项中。")
 
 
 class Cloud:

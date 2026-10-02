@@ -2,18 +2,35 @@ from __future__ import annotations
 
 import copy
 import json
+import sys
 import threading
-import time
 
 import pytest
 import requests
 
-from mijia_plugin.cloud import PluginError, TimedSession, network_scope, parse_spec, validate_value
+from mijia_plugin.cloud import PluginError, TimedSession, network_scope, parse_spec
 from mijia_plugin.controller import Controller, public_error
-from mijia_plugin.storage import Vault
 
 
 PROPERTY = {"key": "2.1", "name": "on", "format": "bool", "access": ["read", "write"], "values": [], "range": None, "siid": 2, "piid": 1}
+
+
+class RecordingLogger:
+    def __init__(self):
+        self.records = []
+
+    def record(self, level, message, fields):
+        assert sys.exception() is None, "日志不能自动附带上游私密异常正文"
+        self.records.append({"level": level, "message": message, "fields": fields or {}})
+
+    def info(self, message, *, fields=None):
+        self.record("info", message, fields)
+
+    def warning(self, message, *, fields=None):
+        self.record("warning", message, fields)
+
+    def error(self, message, *, fields=None):
+        self.record("error", message, fields)
 
 
 class FakeCloud:
@@ -30,6 +47,7 @@ class FakeCloud:
         self.read_code = 0
 
     def login(self, callback):
+        callback(b"test-qr")
         self.persist({"userId": self.uid, "serviceToken": "private-token-test"})
 
     def reconnect(self):
@@ -73,7 +91,7 @@ class FakeCloud:
 
 @pytest.fixture
 def controller(tmp_path):
-    c = Controller(tmp_path, cloud_factory=FakeCloud)
+    c = Controller(tmp_path, cloud_factory=FakeCloud, logger=RecordingLogger())
     c.start("login")
     c.worker.join(3)
     assert c.connected and not c.busy
@@ -176,6 +194,7 @@ def test_write_readback_and_no_automatic_resend(controller):
     assert result["ok"] and not result["confirmed"]
     assert result["readbackError"]["code"] == "NETWORK_TIMEOUT"
     assert len(c.cloud.writes) == 2
+    assert c.logger.records[-1]["fields"]["reason_code"] == "NETWORK_TIMEOUT"
 
 
 def test_rejected_write_never_reports_confirmation(controller):
@@ -185,12 +204,13 @@ def test_rejected_write_never_reports_confirmation(controller):
     assert not result["ok"] and result["status"] == "rejected" and not result["confirmed"]
 
 
-@pytest.mark.parametrize("value", ["true", 1, None, [], {}])
-def test_invalid_property_values_never_send(controller, value):
+def test_cloud_owns_property_value_validation(controller):
     grant(controller)
-    result = controller.tool("write", {"device": "lamp", "property": "2.1", "value": value})
-    assert result["error"]["code"] == "INVALID_VALUE"
-    assert not controller.cloud.writes
+    controller.cloud.ack = -706012043
+    result = controller.tool("write", {"device": "lamp", "property": "2.1", "value": "true"})
+    assert controller.cloud.writes == [("lamp", "2.1", "true")]
+    assert result["ok"] is False and result["serviceCode"] == -706012043
+    assert controller.logger.records[-1]["fields"]["service_code"] == -706012043
 
 
 def test_permission_revoked_during_spec_fetch_prevents_write(controller):
@@ -201,12 +221,11 @@ def test_permission_revoked_during_spec_fetch_prevents_write(controller):
     assert not controller.cloud.writes
 
 
-def test_speaker_directive_cannot_bypass_device_scope(controller):
+def test_cloud_owns_action_validation_without_plugin_blacklist(controller):
     grant(controller)
-    result = controller.tool("action", {"device": "lamp", "action": "3.1"})
-    assert result["error"]["code"] == "ACTION_UNAVAILABLE"
-    assert not controller.cloud.actions
-    assert controller.tool("action", {"device": "lamp", "action": "2.1"})["status"] == "accepted"
+    result = controller.tool("action", {"device": "lamp", "action": "3.1", "values": ["打开灯"]})
+    assert result["status"] == "accepted"
+    assert controller.cloud.actions == [("lamp", "3.1", ["打开灯"])]
 
 
 def test_cancel_login_drops_late_credentials(tmp_path):
@@ -217,7 +236,7 @@ def test_cancel_login_drops_late_credentials(tmp_path):
             entered.set()
             assert release.wait(3)
             self.persist({"userId": "late", "serviceToken": "must-not-save"})
-    c = Controller(tmp_path, cloud_factory=Delayed)
+    c = Controller(tmp_path, cloud_factory=Delayed, logger=RecordingLogger())
     c.start("login")
     assert entered.wait(2)
     worker = c.worker
@@ -240,7 +259,7 @@ def test_account_change_clears_permissions_and_logout_deletes_auth(controller):
 
 def test_permissions_and_credentials_survive_restart(controller):
     grant(controller)
-    c = Controller(controller.root, cloud_factory=FakeCloud)
+    c = Controller(controller.root, cloud_factory=FakeCloud, logger=RecordingLogger())
     try:
         c.resume()
         c.worker.join(3)
@@ -268,6 +287,8 @@ def test_scene_failure_keeps_device_catalog_but_removes_stale_scene(controller):
     controller.worker.join(3)
     assert controller.connected and controller.devices and not controller.scenes
     assert controller.status()["sceneError"]["code"] == "NETWORK_ERROR"
+    assert any(r["level"] == "error" and r["fields"].get("reason_code") == "NETWORK_ERROR" for r in controller.logger.records)
+    assert "do-not-expose-cookie" not in json.dumps(controller.logger.records)
     assert controller.tool("scene", {"scene": "h:1"})["error"]["code"] == "SCENE_NOT_ALLOWED"
 
 
@@ -276,10 +297,7 @@ def test_spec_preserves_action_parameter_definitions():
     spec = parse_spec(raw)
     prop = spec["actions"][0]["inputs"][0]
     assert prop["key"] == "2.1"
-    validate_value(prop, 4)
-    for value in (-1, 11, 3, True, "4"):
-        with pytest.raises(PluginError):
-            validate_value(prop, value)
+    assert prop["range"] == [0, 10, 2] and prop["format"] == "uint8"
 
 
 def test_transport_sets_timeout_and_cancel_prevents_send(monkeypatch):
@@ -291,13 +309,15 @@ def test_transport_sets_timeout_and_cancel_prevents_send(monkeypatch):
         return response
     monkeypatch.setattr(requests.Session, "request", send)
     cancel = threading.Event()
-    with network_scope(cancel, 30), TimedSession() as session:
+    with network_scope(cancel), TimedSession() as session:
         session.get("https://example.invalid")
         assert calls[0]["timeout"] == (5, 15)
+        session.get("https://example.invalid", timeout=120)
+        assert calls[1]["timeout"] == 120
         cancel.set()
         with pytest.raises(PluginError):
             session.post("https://example.invalid")
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 def test_upstream_errors_never_echo_secret_bodies():
@@ -305,3 +325,56 @@ def test_upstream_errors_never_echo_secret_bodies():
     for error in [APIError(-1, "serviceToken=hidden"), LoginError(-2, "Cookie: private"), ValueError("secret-body")]:
         public = json.dumps(public_error(error))
         assert "hidden" not in public and "private" not in public and "secret-body" not in public
+
+
+def test_connection_failure_is_logged_without_raw_authentication_response(tmp_path):
+    from mijiaAPI.errors import APIError
+    class Failed(FakeCloud):
+        def login(self, callback):
+            raise APIError(-10005, "private-auth-response")
+    logger = RecordingLogger()
+    c = Controller(tmp_path, cloud_factory=Failed, logger=logger)
+    try:
+        c.start("login")
+        c.worker.join(3)
+        assert not c.busy and not c.connected
+        failure = logger.records[-1]
+        assert failure["level"] == "error"
+        assert failure["fields"]["serviceCode"] == "-10005"
+        assert "private-auth-response" not in json.dumps(logger.records)
+    finally:
+        c.close()
+
+
+def test_gui_read_and_settings_failures_use_host_logger(controller):
+    from plugin import MijiaPlugin
+    plugin = MijiaPlugin()
+    plugin.controller, plugin.read_worker, plugin.read_result = controller, None, None
+    controller.cloud.fail_read = True
+    request = {"request": {"id": "secret", "requestId": "failed-read"}}
+    plugin.start_read(request)
+    plugin.read_worker.join(3)
+    assert plugin.read_status(request)["values"]["result"]["state"] == "failed"
+    assert controller.logger.records[-1]["fields"]["reason_code"] == "NETWORK_TIMEOUT"
+    with pytest.raises(RuntimeError):
+        plugin.safe(lambda values: controller.save_permissions(values))({"devices": {"missing": {"mode": "read"}}, "scenes": []})
+    assert controller.logger.records[-1]["fields"]["reason_code"] == "INVALID_PERMISSIONS"
+
+
+def test_partial_read_failure_and_lifecycle_are_logged_without_poll_noise(controller):
+    from plugin import MijiaPlugin
+    plugin = MijiaPlugin()
+    plugin.controller = controller
+    assert controller.tool("status", {})["connected"] is True
+    count = len(controller.logger.records)
+    plugin.settings()
+    plugin.records("devices")
+    assert len(controller.logger.records) == count
+    assert all(r["level"] == "info" for r in controller.logger.records)
+    grant(controller)
+    controller.cloud.read_code = -704042011
+    result = controller.tool("read", {"device": "lamp"})
+    assert result["properties"][0]["code"] == -704042011
+    failure = next(r for r in controller.logger.records if r["level"] == "error")
+    assert failure["fields"] == {"property": "2.1", "service_code": -704042011}
+    assert "must-not-escape" not in json.dumps(controller.logger.records)

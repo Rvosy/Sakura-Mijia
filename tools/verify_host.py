@@ -24,6 +24,25 @@ from app.core_host.runtime_logging import install_runtime_logging
 from app.plugin_sdk.sakura_tools import ToolRegistry
 from app.storage.runtime_roots import RuntimeRoots
 
+
+class LogOutput(io.BytesIO):
+    def __init__(self):
+        super().__init__()
+        self.condition = threading.Condition()
+
+    def write(self, value):
+        with self.condition:
+            result = super().write(value)
+            self.condition.notify_all()
+            return result
+
+    def plugin_records(self):
+        return [record for line in self.getvalue().splitlines()
+                if line.startswith(b"SAKURA_RUNTIME_LOG_V1\t")
+                for record in [json.loads(line.split(b"\t", 1)[1])]
+                if record.get("plugin_id") == "dev.sakura.mijia"]
+
+
 with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
     work = Path(temporary)
     distribution = work / "distribution"
@@ -35,9 +54,9 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
     uv_source = args.sakura / "runtime" / ("Scripts" if os.name == "nt" else "bin") / uv_name
     shutil.copy2(uv_source, uv_dir / uv_name)
     roots = RuntimeRoots(distribution, work / "user")
-    record = LocalPluginInstaller(roots).install(root / "dist/Sakura-Mijia-0.3.0.sakplugin.zip", "zip", initial_enabled=True)
+    record = LocalPluginInstaller(roots).install(root / "dist/Sakura-Mijia-0.3.1.sakplugin.zip", "zip", initial_enabled=True)
     registry = ToolRegistry()
-    log_output = io.BytesIO()
+    log_output = LogOutput()
     bridge = install_runtime_logging(log_output)
     host = PluginApplicationHost(roots, "mijia-package-verification", registry)
     try:
@@ -47,6 +66,13 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
         names = sorted(t.name for t in registry.all())
         assert len(names) == 8 and "mijia_set_property" in names
         assert registry.execute("mijia_list_devices", {}).content["error"]["code"] == "LOGIN_REQUIRED"
+        with log_output.condition:
+            assert log_output.condition.wait_for(lambda: any(
+                r.get("custom") is True and r["severity"] == "error" and r.get("attributes", {}).get("reason_code") == "LOGIN_REQUIRED"
+                for r in log_output.plugin_records()), timeout=5), "插件失败未进入 GUI 日志桥接"
+            records = [r for r in log_output.plugin_records() if r.get("custom") is True]
+            assert all(r["custom"] and r["plugin_name"] == "米家" for r in records)
+            assert any(r["severity"] == "info" for r in records), "插件启动状态未进入 GUI 日志桥接"
         snapshot = host.settings_snapshot()
         item = next(p for p in snapshot["plugins"] if p["pluginId"] == "dev.sakura.mijia")
         assert item["state"] == "active" and item["sections"]
@@ -72,7 +98,7 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
             assert not host.call_service('dev.sakura.mijia', 'status')['connected']
         host.set_enabled(item['installId'], False)
         assert registry.all() == []
-        print(json.dumps({"installed": record.plugin_id, "tools": names, "settings": "registered", "cleanup": "passed"}, ensure_ascii=True))
+        print(json.dumps({"installed": record.plugin_id, "tools": names, "settings": "registered", "guiLogBridge": "passed", "cleanup": "passed"}, ensure_ascii=True))
     finally:
         host.close()
         bridge.close()

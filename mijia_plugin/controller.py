@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import re
 import threading
@@ -9,8 +8,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import requests
+from mijiaAPI.errors import APIError, LoginError
 
-from .cloud import Cloud, PluginError, network_scope, validate_value
+from .cloud import Cloud, PluginError, network_scope
 from .storage import Vault, atomic_write
 from .state_view import state_rows
 
@@ -25,9 +25,9 @@ def public_error(error: Exception) -> dict:
     if isinstance(error, requests.HTTPError):
         status = error.response.status_code if error.response is not None else None
         return {"code": "HTTP_ERROR", "message": "米家服务返回 HTTP 错误。", "httpStatus": status}
-    if type(error).__name__ == "LoginError":
+    if isinstance(error, LoginError):
         return {"code": "LOGIN_REQUIRED", "message": "登录未完成或凭据失效，请重新扫码。"}
-    if type(error).__name__ == "APIError":
+    if isinstance(error, APIError):
         code = re.search(r"code[:：= ]+(-?\d+)", str(error), re.I)
         return {"code": "MIJIA_API_ERROR", "message": "米家服务拒绝了请求。", "serviceCode": code.group(1) if code else None}
     # Do not expose raw upstream exceptions: they may contain cookies or response bodies.
@@ -41,12 +41,8 @@ def _matches(items, key):
     raise PluginError("CAPABILITY_NOT_FOUND", "设备没有这项能力，请先查询设备能力。")
 
 
-def _action_allowed(action):
-    return "text-directive" not in action["name"] and not any(p.get("unsupported") for p in action["inputs"])
-
-
 class Controller:
-    def __init__(self, root: Path, *, cloud_factory=Cloud, logger=None):
+    def __init__(self, root: Path, *, logger, cloud_factory=Cloud):
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
         self.vault = Vault(root)
@@ -73,8 +69,16 @@ class Controller:
         self.last_operation = None
 
     def resume(self):
+        self.logger.info("米家插件已启动")
         if self.vault.exists():
             self.start("reconnect")
+
+    def report_error(self, message, problem, **fields):
+        # Call after leaving the except block: the SDK otherwise attaches raw
+        # upstream exception text, which may contain authentication responses.
+        emit = self.logger.info if problem["code"] == "CANCELLED" else self.logger.error
+        emit(f"{message}：{problem['message']}", fields={"reason_code": problem["code"],
+             **{k: v for k, v in problem.items() if k not in ("code", "message")}, **fields})
 
     def _save_policy(self):
         atomic_write(self.policy_path, json.dumps(self.policy, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -86,9 +90,7 @@ class Controller:
     def _persist(self, epoch, auth):
         with self.lock:
             self._active(epoch)
-            uid = str(auth.get("userId", ""))
-            if not uid:
-                raise PluginError("INVALID_ACCOUNT", "米家未返回有效账号。")
+            uid = str(auth["userId"])
             if self.policy["account"] != uid:
                 self.policy = {"account": uid, "devices": {}, "scenes": []}
                 self._save_policy()
@@ -98,11 +100,11 @@ class Controller:
         with self.lock:
             modes = self.policy["devices"]
             return {"connected": self.connected, "busy": self.busy, "loginState": self.login_state,
-                    "error": copy.deepcopy(self.error), "sceneError": copy.deepcopy(self.scene_error),
+                    "error": dict(self.error) if self.error else None, "sceneError": dict(self.scene_error) if self.scene_error else None,
                     "hasQr": self.qr is not None, "lastRefresh": self.last_refresh,
                     "deviceCount": len(self.devices),
                     "allowedCount": sum(1 for did, rule in modes.items() if did in self.devices and rule["mode"] != "hidden"),
-                    "lastOperation": copy.deepcopy(self.last_operation)}
+                    "lastOperation": dict(self.last_operation) if self.last_operation else None}
 
     def snapshot(self):
         with self.lock:
@@ -124,14 +126,16 @@ class Controller:
             epoch, cancel = self.epoch, self.cancel
             if kind in ("login", "reconnect"):
                 self.login_state = "starting"
+            self.logger.info({"login": "米家开始扫码登录", "reconnect": "米家正在恢复连接", "refresh": "米家正在刷新设备和场景"}[kind])
             self.worker = threading.Thread(target=self._background, args=(kind, epoch, cancel), daemon=True, name="mijia-connection")
             self.worker.start()
             return self.status()
 
     def _background(self, kind, epoch, cancel):
         client = None
+        problem = None
         try:
-            with self.io_lock, network_scope(cancel, 180 if kind == "login" else 90):
+            with self.io_lock, network_scope(cancel):
                 with self.lock:
                     self._active(epoch)
                     client = self.cloud if kind == "refresh" else None
@@ -143,6 +147,7 @@ class Controller:
                                 self._active(epoch)
                                 self.qr = png
                                 self.login_state = "waiting"
+                                self.logger.info("米家二维码已就绪，等待扫码确认")
                         client.login(on_qr)
                     else:
                         client.reconnect()
@@ -153,6 +158,7 @@ class Controller:
                         self.connected = True
                         self.login_state = "connected"
                         self.qr = None
+                        self.logger.info("米家账号已连接")
                     if old and old is not client:
                         old.close()
                 devices = client.catalog()
@@ -171,16 +177,19 @@ class Controller:
                     self._active(epoch)
                     self.scenes = scenes
                     self.scene_error = scene_error
+                    self.logger.info("米家设备和场景已刷新", fields={"device_count": len(devices), "scene_count": len(scenes)})
+                    if scene_error:
+                        self.report_error("米家场景加载失败", scene_error)
         except Exception as error:
             with self.lock:
                 if epoch == self.epoch and not self.closed:
-                    self.error = public_error(error)
+                    problem = self.error = public_error(error)
                     self.qr = None
                     if not self.connected:
                         self.login_state = "error"
-                    if self.logger:
-                        self.logger.warning("米家连接操作失败", fields={"reason_code": self.error["code"]})
         finally:
+            if problem:
+                self.report_error("米家连接操作失败", problem, operation=kind)
             with self.lock:
                 if epoch == self.epoch:
                     self.busy = False
@@ -192,26 +201,24 @@ class Controller:
         with self.lock:
             if not self.connected:
                 raise PluginError("LOGIN_REQUIRED", "请先扫码登录。")
-            devices, scenes = value.get("devices"), value.get("scenes")
-            if not isinstance(devices, dict) or not isinstance(scenes, list):
-                raise PluginError("INVALID_PERMISSIONS", "设备权限格式无效。")
+            devices, scenes = value["devices"], value["scenes"]
             clean = {}
             for did, rule in devices.items():
-                if did not in self.devices or not isinstance(rule, dict) or rule.get("mode") not in ("hidden", "read", "control"):
+                if did not in self.devices or rule["mode"] not in ("hidden", "read", "control"):
                     raise PluginError("INVALID_PERMISSIONS", "设备列表已变化，请刷新后重试。")
                 alias = rule.get("alias", "")
-                if not isinstance(alias, str) or len(alias) > 120:
-                    raise PluginError("INVALID_ALIAS", "设备别名最多 120 个字符。")
                 if rule["mode"] != "hidden" or alias.strip():
                     clean[did] = {"mode": rule["mode"], "alias": alias.strip()}
-            if any(not isinstance(key, str) or key not in self.scenes for key in scenes):
+            if any(key not in self.scenes for key in scenes):
                 raise PluginError("INVALID_PERMISSIONS", "场景列表已变化，请刷新后重试。")
-            self.policy = {**self.policy, "devices": clean, "scenes": list(dict.fromkeys(scenes))}
+            self.policy = {**self.policy, "devices": clean, "scenes": scenes}
             self._save_policy()
+            self.logger.info("米家桌宠权限已保存", fields={"device_count": len(clean), "scene_count": len(scenes)})
             return {"saved": True}
 
     def logout(self):
         with self.lock:
+            connected = self.connected
             self.cancel.set()
             self.epoch += 1
             self.cancel = threading.Event()
@@ -228,11 +235,10 @@ class Controller:
             self._save_policy()
         if old:
             old.close()
+        self.logger.info("米家已退出登录，凭据和桌宠权限已清除" if connected else "米家登录已取消")
         return {"loggedOut": True}
 
     def _device(self, did, write=False):
-        if not self.connected:
-            raise PluginError("LOGIN_REQUIRED", "请在米家插件设置中扫码登录。")
         rule = self.policy["devices"].get(did, {})
         if did not in self.devices or rule.get("mode", "hidden") == "hidden" or (write and rule.get("mode") != "control"):
             raise PluginError("DEVICE_NOT_ALLOWED", "此设备未获准执行该操作，请在插件设置中调整权限。")
@@ -260,25 +266,34 @@ class Controller:
 
     def tool(self, name, args):
         try:
-            return self._tool(name, args)
+            result = self._tool(name, args)
         except Exception as error:
             problem = public_error(error)
-            if self.logger:
-                self.logger.warning("米家工具调用失败", fields={"reason_code": problem["code"]})
-            return {"ok": False, "error": problem}
+            result = {"ok": False, "error": problem}
+        operation = {"status": "查询连接状态", "devices": "查询设备列表", "capabilities": "查询设备能力",
+                     "read": "读取设备状态", "write": "设置设备属性", "action": "执行设备动作",
+                     "scenes": "查询场景列表", "scene": "执行场景"}[name]
+        if result.get("error"):
+            self.report_error(f"米家{operation}失败", result["error"], operation=name)
+        elif result.get("ok") is False:
+            self.logger.error(f"米家{operation}被拒绝", fields={"operation": name, "service_code": result.get("serviceCode")})
+        else:
+            message = result.get("message", "已完成。")
+            self.logger.info(f"米家{operation}：{message}", fields={"operation": name, **({"confirmed": result["confirmed"]} if "confirmed" in result else {})})
+        if "readbackError" in result:
+            self.report_error("米家指令已接收，但读回状态失败", result["readbackError"], operation=name)
+        return result
 
     def read_for_user(self, did):
         """Settings-only read. The pet's allowlist is not the owner's authority."""
         with self._operation() as (client, epoch):
             with self.lock:
-                if not isinstance(did, str) or did not in self.devices:
+                if did not in self.devices:
                     raise PluginError("DEVICE_NOT_FOUND", "设备列表已变化，请刷新设备。")
                 device = dict(self.devices[did])
             spec = client.spec(device["model"])
             with self.lock:
                 self._active(epoch)
-                if did not in self.devices:
-                    raise PluginError("DEVICE_NOT_FOUND", "设备列表已变化，请刷新设备。")
             props = [p for p in spec["properties"] if "read" in p["access"]]
             if not props:
                 return {"id": did, "title": device["name"], "rows": [], "message": "此设备没有可读取的属性。"}
@@ -308,7 +323,6 @@ class Controller:
         with self._operation() as (client, epoch):
             if name == "scene":
                 with self.lock:
-                    self._active(epoch)
                     key = args.get("scene")
                     if key not in self.scenes or key not in self.policy["scenes"]:
                         raise PluginError("SCENE_NOT_ALLOWED", "此场景未获准执行。")
@@ -318,6 +332,7 @@ class Controller:
                 # request; a false boolean or explicit nonzero code is failure.
                 accepted = raw is True or (isinstance(raw, dict) and raw.get("code", 0) == 0)
                 result = {"ok": accepted, "status": "accepted" if accepted else "rejected", "confirmed": False,
+                          "serviceCode": raw.get("code") if isinstance(raw, dict) else None,
                           "message": "米家已接收场景请求，场景内各设备状态尚未确认。" if accepted else "米家拒绝了场景请求。"}
             else:
                 did = args.get("device")
@@ -330,21 +345,18 @@ class Controller:
                     self._device(did, name in ("write", "action"))
                 if name == "capabilities":
                     return {"device": did, "properties": spec["properties"],
-                            "actions": [dict(a, available=_action_allowed(a)) for a in spec["actions"]]}
+                            "actions": spec["actions"]}
                 if name == "read":
                     keys = args.get("properties")
                     props = [_matches(spec["properties"], key) for key in keys] if keys else [p for p in spec["properties"] if "read" in p["access"]]
-                    if not props or any("read" not in p["access"] for p in props):
-                        raise PluginError("NOT_READABLE", "所选属性不可读取。")
+                    if not props:
+                        return {"device": did, "observedAt": time.time(), "properties": []}
                     raw = client.read(did, props)
                     values = self._read_result(raw, props)
                     return {"device": did, "observedAt": time.time(), "properties": values}
                 if name == "write":
                     prop = _matches(spec["properties"], args.get("property"))
-                    if "write" not in prop["access"]:
-                        raise PluginError("NOT_WRITABLE", "所选属性不可写入。")
                     value = args.get("value")
-                    validate_value(prop, value)
                     raw = client.write(did, prop, value)
                     result = self._receipt(raw)
                     if result["ok"] and "read" in prop["access"]:
@@ -359,12 +371,6 @@ class Controller:
                 elif name == "action":
                     action = _matches(spec["actions"], args.get("action"))
                     values = args.get("values", [])
-                    if not _action_allowed(action):
-                        raise PluginError("ACTION_UNAVAILABLE", "此动作缺少参数定义或可绕过设备授权范围，未开放。")
-                    if not isinstance(values, list) or len(values) != len(action["inputs"]):
-                        raise PluginError("INVALID_ARGUMENTS", "动作参数数量与设备能力不符。")
-                    for prop, value in zip(action["inputs"], values):
-                        validate_value(prop, value)
                     result = self._receipt(client.action(did, action, values))
                 elif name != "write":
                     raise PluginError("UNKNOWN_TOOL", "未知工具。")
@@ -381,8 +387,7 @@ class Controller:
         return {"ok": code in (0, 1), "status": "accepted" if code in (0, 1) else "rejected", "serviceCode": code,
                 "confirmed": False, "message": "指令已被接收，完成情况尚未确认。" if code in (0, 1) else "设备未确认接收指令。"}
 
-    @staticmethod
-    def _read_result(raw, props):
+    def _read_result(self, raw, props):
         rows = raw if isinstance(raw, list) else [raw]
         by_key = {(r.get("siid"), r.get("piid")): r for r in rows if isinstance(r, dict)}
         result = []
@@ -392,6 +397,9 @@ class Controller:
             if item["code"] == 0 and "value" in row:
                 item["value"] = row["value"]
             result.append(item)
+        for item in result:
+            if item["code"] != 0:
+                self.logger.error("米家属性读取失败", fields={"property": item["property"], "service_code": item["code"]})
         return result
 
     def close(self):
@@ -405,3 +413,4 @@ class Controller:
             client.close()
         if self.worker:
             self.worker.join(timeout=1)
+        self.logger.info("米家插件已停止")

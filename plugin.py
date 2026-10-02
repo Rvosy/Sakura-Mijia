@@ -15,7 +15,7 @@ def tool_definitions():
         ("capabilities", "mijia_get_capabilities", "读取已授权设备的属性、取值范围、枚举与动作参数。控制前查询；不可猜测 key 或枚举值。", {"device": device}, ["device"], "low"),
         ("read", "mijia_get_state", "读取已授权设备的当前属性；省略 properties 时读取全部可读属性。每个属性的 code=0 才表示读取成功。", {"device": device, "properties": {"type": "array", "items": key}}, ["device"], "low"),
         ("write", "mijia_set_property", "设置获准控制的米家设备属性。value 必须符合设备能力的原始类型与取值。accepted 仅表示接收，confirmed=true 才表示读回目标状态；超时不要盲目重发。", {"device": device, "property": key, "value": {"type": ["string", "boolean", "number", "integer"]}}, ["device", "property", "value"], "high"),
-        ("action", "mijia_run_action", "执行获准控制的设备动作，values 按能力 inputs 顺序提供。仅调用 available=true 的动作；回执不代表动作完成，失败或超时后不要盲目重发。", {"device": device, "action": key, "values": {"type": "array", "items": {"type": ["string", "boolean", "number", "integer"]}}}, ["device", "action"], "high"),
+        ("action", "mijia_run_action", "执行获准控制的设备动作，values 按能力 inputs 顺序提供。参数由米家校验；回执不代表动作完成，失败或超时后不要盲目重发。", {"device": device, "action": key, "values": {"type": "array", "items": {"type": ["string", "boolean", "number", "integer"]}}}, ["device", "action"], "high"),
         ("scenes", "mijia_list_scenes", "列出用户单独授权的米家手动场景。", {}, [], "low"),
         ("scene", "mijia_run_scene", "执行用户单独授权的手动场景，可能同时改变多个设备。只能使用列表返回的 key；回执不代表所有设备执行完成。", {"scene": {"type": "string"}}, ["scene"], "high"),
     ]
@@ -45,7 +45,7 @@ class MijiaPlugin:
                                        for key in ("login", "refresh", "cancel", "logout")})
         self.register_records(settings, "devices", "设备", [
             {"key": "name", "label": "设备", "type": "readonly"},
-            {"key": "alias", "label": "别名", "type": "string", "default": "", "maxLength": 120},
+            {"key": "alias", "label": "别名", "type": "string", "default": ""},
             {"key": "mode", "label": "桌宠权限", "type": "select", "default": "hidden", "options": [
                 {"value": "hidden", "label": "不开放"}, {"value": "read", "label": "仅查询"},
                 {"value": "control", "label": "允许控制"}]}], "新设备默认不向桌宠开放。", inspect=True)
@@ -74,13 +74,14 @@ class MijiaPlugin:
                 "qr": {"dataUrl": "data:image/png;base64," + base64.b64encode(png).decode("ascii"), "alt": "用米家 App 扫码，并在手机上确认"} if png else None,
                 "available": (["logout"] if state["busy"] else ["refresh", "logout"]) if state["connected"] else ["cancel"] if state["busy"] else ["login"]}
 
-    @staticmethod
-    def safe(callback):
+    def safe(self, callback):
         def run(values):
             try:
                 return callback(values)
             except Exception as error:
-                raise RuntimeError(public_error(error)["message"]) from None
+                problem = public_error(error)
+            self.controller.report_error("米家设置操作失败", problem)
+            raise RuntimeError(problem["message"]) from None
         return run
 
     def connection_action(self, key):
@@ -108,20 +109,26 @@ class MijiaPlugin:
                           load=lambda: self.records(section), save=self.safe(lambda values: self.save_records(section, values)), actions=actions)
 
     def start_read(self, values):
-        request = values.get("request", {})
-        did, request_id = request.get("id"), request.get("requestId")
-        if not isinstance(did, str) or not isinstance(request_id, str) or not request_id:
-            raise ValueError("Invalid request")
+        request = values["request"]
+        did, request_id = request["id"], request["requestId"]
         with self.controller.lock:
             result = {"id": did, "requestId": request_id, "title": "设备状态", "rows": [], "message": "", "state": "running"}
             if self.read_worker and self.read_worker.is_alive():
+                self.controller.logger.warning("米家正在读取设备，未受理重复读取")
                 return {"values": {"result": {**result, "state": "failed", "message": "正在读取设备，请稍后再试。"}}}
             self.read_result = result
+            self.controller.logger.info("米家开始手动读取设备状态")
             def read():
+                problem = None
                 try:
                     outcome = {**self.controller.read_for_user(did), "state": "completed"}
                 except Exception as error:
-                    outcome = {"state": "failed", "message": public_error(error)["message"]}
+                    problem = public_error(error)
+                    outcome = {"state": "failed", "message": problem["message"]}
+                if problem:
+                    self.controller.report_error("米家手动读取设备状态失败", problem)
+                else:
+                    self.controller.logger.info("米家手动读取设备状态完成", fields={"property_count": len(outcome["rows"])})
                 with self.controller.lock:
                     self.read_result = {**result, **outcome}
             self.read_worker = threading.Thread(target=read, daemon=True, name="mijia-state")
@@ -147,8 +154,6 @@ class MijiaPlugin:
         return {"visible": snapshot["connected"], "items": items, "grants": grants, **({"request": {}, "result": {}} if section == "devices" else {})}
 
     def save_records(self, section, values):
-        if "grants" not in values:
-            return {}
         with self.controller.lock:
             policy = self.controller.policy
             devices = values["grants"] if section == "devices" else {key: value for key, value in policy["devices"].items() if key in self.controller.devices}
