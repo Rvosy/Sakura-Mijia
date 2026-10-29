@@ -60,6 +60,9 @@ class FakeCloud:
     def scenes(self):
         return {"h:1": {"key": "h:1", "name": "回家", "home_id": "h", "scene_id": "1"}}
 
+    def image(self, model):
+        return "data:image/png;base64,iVBORw0KGgo="
+
     def spec(self, model):
         if self.spec_hook:
             self.spec_hook()
@@ -94,6 +97,7 @@ def controller(tmp_path):
     c = Controller(tmp_path, cloud_factory=FakeCloud, logger=RecordingLogger())
     c.start("login")
     c.worker.join(3)
+    c.image_worker.join(3)
     assert c.connected and not c.busy
     yield c
     c.close()
@@ -156,30 +160,58 @@ def test_native_read_returns_immediately_and_polls_without_saving_grants(control
         assert plugin.start_read(request)["values"]["result"]["state"] == "running"
         assert entered.wait(3)
         assert plugin.read_status(request)["values"]["result"]["state"] == "running"
-        assert plugin.records("devices")["grants"]["secret"]["mode"] == "hidden"
+        assert plugin.workspace()["grants"]["secret"]["mode"] == "hidden"
     finally:
         finish.set()
         plugin.read_worker.join(3)
     result = plugin.read_status(request)["values"]["result"]
     assert result["state"] == "completed" and result["rows"][0]["value"] == "关"
-    plugin.save_records("devices", {"grants": {"lamp": {"mode": "read", "alias": "台灯"}}})
-    plugin.save_records("scenes", {"grants": {"h:1": {"allowed": True}}})
+    plugin.save_workspace({"grants": {"lamp": {"mode": "read", "alias": "台灯"}}})
+    plugin.save_workspace({"sceneGrants": {"h:1": {"allowed": True}}})
     assert controller.policy["devices"]["lamp"]["mode"] == "read"
     assert controller.policy["scenes"] == ["h:1"]
 
 
-def test_connection_actions_and_records_follow_login_state(controller):
+def test_connection_actions_and_workspace_follow_login_state(controller):
     from plugin import MijiaPlugin
     plugin = MijiaPlugin()
     plugin.controller = controller
     assert plugin.settings()["available"] == ["refresh", "logout"]
-    assert plugin.records("devices")["visible"] is True
+    assert plugin.workspace()["visible"] is True
     controller.logout()
     assert plugin.settings()["available"] == ["login"]
-    assert plugin.records("devices")["visible"] is False
+    assert plugin.workspace()["visible"] is False
     controller.busy, controller.login_state, controller.qr = True, "waiting", b"fixture"
     assert plugin.settings()["available"] == ["cancel"]
     assert plugin.settings()["qr"] is not None
+
+
+@pytest.mark.parametrize("unavailable, changes", [
+    ("scenes", {"grants": {"lamp": {"mode": "read", "alias": "新别名"}}}),
+    ("devices", {"sceneGrants": {"h:1": {"allowed": False}}}),
+])
+@pytest.mark.parametrize("whole_section", [False, True])
+def test_settings_save_preserves_unavailable_permissions(controller, unavailable, changes, whole_section):
+    from plugin import MijiaPlugin
+    plugin = MijiaPlugin()
+    plugin.controller = controller
+    grant(controller, scenes=["h:1"])
+    previous = copy.deepcopy(controller.policy[unavailable])
+    setattr(controller, unavailable, {})
+    if whole_section:
+        values = plugin.workspace()
+        changes = {"grants": values["grants"], "sceneGrants": values["sceneGrants"], **changes}
+
+    plugin.save_workspace(changes)
+
+    saved = json.loads(controller.policy_path.read_text("utf-8"))
+    assert saved[unavailable] == previous
+    if unavailable == "scenes":
+        assert saved["devices"]["lamp"] == {"mode": "read", "alias": "新别名"}
+        assert controller.tool("scene", {"scene": "h:1"})["error"]["code"] == "SCENE_NOT_ALLOWED"
+    else:
+        assert saved["scenes"] == []
+        assert controller.tool("read", {"device": "lamp"})["error"]["code"] == "DEVICE_NOT_ALLOWED"
 
 
 def test_write_readback_and_no_automatic_resend(controller):
@@ -368,7 +400,7 @@ def test_partial_read_failure_and_lifecycle_are_logged_without_poll_noise(contro
     assert controller.tool("status", {})["connected"] is True
     count = len(controller.logger.records)
     plugin.settings()
-    plugin.records("devices")
+    plugin.workspace()
     assert len(controller.logger.records) == count
     assert all(r["level"] == "info" for r in controller.logger.records)
     grant(controller)
@@ -378,3 +410,75 @@ def test_partial_read_failure_and_lifecycle_are_logged_without_poll_noise(contro
     failure = next(r for r in controller.logger.records if r["level"] == "error")
     assert failure["fields"] == {"property": "2.1", "service_code": -704042011}
     assert "must-not-escape" not in json.dumps(controller.logger.records)
+
+
+def test_image_loading_does_not_block_device_reads_and_logout_drops_late_images(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+
+    class DelayedImages(FakeCloud):
+        def image(self, model):
+            entered.set()
+            assert release.wait(3)
+            return "data:image/png;base64,late"
+
+    c = Controller(tmp_path, cloud_factory=DelayedImages, logger=RecordingLogger())
+    try:
+        c.start("login")
+        c.worker.join(3)
+        assert entered.wait(3)
+        assert c.read_for_user("lamp")["rows"]
+        c.logout()
+        release.set()
+        c.image_worker.join(3)
+        assert c.images == {} and not c.snapshot()["devices"]
+    finally:
+        release.set()
+        c.close()
+
+
+def test_product_images_are_cached_by_model_and_use_a_separate_download(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from mijia_plugin import cloud
+
+    calls = []
+    class Session:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return SimpleNamespace(status_code=302, headers={"Location": "https://cdn.example/lamp.png"})
+
+    client = cloud.Cloud.__new__(cloud.Cloud)
+    client.image_root = tmp_path / "images"
+    client.api = SimpleNamespace(_refresh_token=lambda: None, auth_data={"ssecurity": "secret"}, session=Session(), api_base_url="https://api.example/app")
+    monkeypatch.setattr(cloud, "get_signed_nonce", lambda *_: "signed")
+    monkeypatch.setattr(cloud, "generate_enc_params", lambda *args: args[4])
+    downloads = []
+    def download(url):
+        downloads.append(url)
+        return SimpleNamespace(headers={"Content-Type": "image/png"}, content=b"image-bytes")
+    monkeypatch.setattr(cloud._Requests, "get", download)
+    value = client.image("vendor.light.v1")
+    assert value.startswith("data:image/png;base64,")
+    assert json.loads(calls[0][1]["data"]["data"]) == {"icon_name": "icon_real", "model": "vendor.light.v1"}
+    assert calls[0][1]["allow_redirects"] is False
+    client.api = None
+    assert client.image("vendor.light.v1") == value
+    assert downloads == ["https://cdn.example/lamp.png"]
+
+
+def test_image_failure_keeps_catalog_permissions_and_state_reading(tmp_path):
+    class NoImages(FakeCloud):
+        def image(self, model):
+            raise requests.Timeout()
+
+    c = Controller(tmp_path, cloud_factory=NoImages, logger=RecordingLogger())
+    try:
+        c.start("login")
+        c.worker.join(3)
+        c.image_worker.join(3)
+        grant(c, "read")
+        assert c.status()["error"] is None
+        assert len(c.snapshot()["devices"]) == 2
+        assert c.tool("read", {"device": "lamp"})["properties"][0]["value"] is False
+        assert any(record["level"] == "warning" for record in c.logger.records)
+    finally:
+        c.close()

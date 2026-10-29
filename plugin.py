@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import threading
+from pathlib import Path
 
 from mijia_plugin.controller import Controller, public_error
 
@@ -43,16 +44,19 @@ class MijiaPlugin:
                         [("login", "扫码登录"), ("refresh", "刷新设备"), ("cancel", "取消登录"), ("logout", "退出登录")]],
         }, load=self.settings, actions={key: self.safe(lambda _, k=key: self.connection_action(k))
                                        for key in ("login", "refresh", "cancel", "logout")})
-        self.register_records(settings, "devices", "设备", [
-            {"key": "name", "label": "设备", "type": "readonly"},
-            {"key": "alias", "label": "别名", "type": "string", "default": ""},
-            {"key": "mode", "label": "桌宠权限", "type": "select", "default": "hidden", "options": [
-                {"value": "hidden", "label": "不开放"}, {"value": "read", "label": "仅查询"},
-                {"value": "control", "label": "允许控制"}]}], "新设备默认不向桌宠开放。", inspect=True)
-        self.register_records(settings, "scenes", "场景", [
-            {"key": "name", "label": "场景", "type": "readonly"},
-            {"key": "allowed", "label": "允许桌宠执行", "type": "boolean", "default": False}],
-            "授权场景会开放其中的全部动作，包括未单独开放的设备。")
+        settings.register({
+            "sectionId": "workspace", "title": "设备与场景", "order": 1,
+            "presentation": {"component": "module", "visibleField": "visible",
+                             "source": Path(__file__).with_name("mijia_plugin").joinpath("workspace.js").read_text("utf-8")},
+            "fields": [{"key": key, "label": label, "type": "data", "readonly": readonly, "default": default}
+                       for key, label, readonly, default in [
+                           ("items", "设备", True, []), ("grants", "设备权限", False, {}),
+                           ("sceneItems", "场景", True, []), ("sceneGrants", "场景权限", False, {}),
+                           ("request", "读取请求", False, {}), ("result", "设备状态", True, {})]]
+                      + [{"key": "visible", "label": "已连接", "type": "boolean", "readonly": True, "default": False}],
+            "actions": [{"actionId": key, "label": "读取状态"} for key in ("read", "read_status")],
+        }, load=self.workspace, save=self.safe(self.save_workspace),
+            actions={"read": self.safe(self.start_read), "read_status": self.safe(self.read_status)})
         host_tools = context.get("sakura.host.tools")
         for operation, descriptor in tool_definitions():
             host_tools.register(descriptor, lambda args, op=operation: self.controller.tool(op, args))
@@ -91,22 +95,18 @@ class MijiaPlugin:
             self.controller.start(key)
         return {"values": self.settings()}
 
-    def register_records(self, settings, section, title, columns, note, inspect=False):
-        fields = [{"key": "items", "label": title, "type": "data", "readonly": True, "default": []},
-                  {"key": "visible", "label": "已连接", "type": "boolean", "readonly": True, "default": False},
-                  {"key": "grants", "label": "桌宠权限", "type": "data", "default": {}}]
-        presentation = {"component": "record-table", "itemsField": "items", "valueField": "grants", "columns": columns, "note": note, "visibleField": "visible"}
-        actions = {}
-        if inspect:
-            fields += [{"key": "request", "label": "读取请求", "type": "data", "default": {}},
-                       {"key": "result", "label": "设备状态", "type": "data", "readonly": True, "default": {}}]
-            presentation.update(inspectAction="read", statusAction="read_status", requestField="request", resultField="result")
-            actions["read"] = self.safe(self.start_read)
-            actions["read_status"] = self.safe(self.read_status)
-        settings.register({"sectionId": section, "title": title, "order": 1 if inspect else 2,
-                           "fields": fields, "presentation": presentation,
-                           "actions": [{"actionId": key, "label": "读取状态"} for key in actions]},
-                          load=lambda: self.records(section), save=self.safe(lambda values: self.save_records(section, values)), actions=actions)
+    def workspace(self):
+        snapshot = self.controller.snapshot()
+        return {
+            "visible": snapshot["connected"],
+            "items": [{"id": d["did"], "label": d["name"], "description": " / ".join(v for v in (d["home"], d["room"]) if v),
+                       "home": d["home"], "room": d["room"], "model": d["model"], "image": d["image"], "online": d["online"]}
+                      for d in snapshot["devices"]],
+            "grants": {d["did"]: {"mode": d["mode"], "alias": d["alias"]} for d in snapshot["devices"]},
+            "sceneItems": [{"id": s["key"], "label": s["name"], "description": s.get("home", "")} for s in snapshot["scenes"]],
+            "sceneGrants": {s["key"]: {"allowed": s["allowed"]} for s in snapshot["scenes"]},
+            "request": {}, "result": {},
+        }
 
     def start_read(self, values):
         request = values["request"]
@@ -142,23 +142,13 @@ class MijiaPlugin:
                 return {"values": {"result": dict(self.read_result)}}
         return {"values": {"result": {**request, "state": "failed", "title": "设备状态", "rows": [], "message": "读取已结束，请重新读取。"}}}
 
-    def records(self, section):
-        snapshot = self.controller.snapshot()
-        items, grants = [], {}
-        for item in snapshot[section]:
-            key = item["did"] if section == "devices" else item["key"]
-            description = " / ".join(str(item.get(k) or "") for k in ("home", "room") if item.get(k))
-            items.append({"id": key, "label": item["name"], "description": description, "values": {"name": item["name"]},
-                          "status": {"state": "warning", "label": "离线"} if section == "devices" and item.get("online") is False else None})
-            grants[key] = {"mode": item["mode"], "alias": item["alias"]} if section == "devices" else {"allowed": item["allowed"]}
-        return {"visible": snapshot["connected"], "items": items, "grants": grants, **({"request": {}, "result": {}} if section == "devices" else {})}
-
-    def save_records(self, section, values):
-        with self.controller.lock:
-            policy = self.controller.policy
-            devices = values["grants"] if section == "devices" else {key: value for key, value in policy["devices"].items() if key in self.controller.devices}
-            scenes = [key for key, value in values["grants"].items() if value.get("allowed") is True] if section == "scenes" else [key for key in policy["scenes"] if key in self.controller.scenes]
-            self.controller.save_permissions({"devices": devices, "scenes": scenes})
+    def save_workspace(self, values):
+        changes = {}
+        if "grants" in values:
+            changes["devices"] = values["grants"]
+        if "sceneGrants" in values:
+            changes["scenes"] = [key for key, value in values["sceneGrants"].items() if value.get("allowed") is True]
+        self.controller.save_permissions(changes)
         return {}
 
     def close(self):

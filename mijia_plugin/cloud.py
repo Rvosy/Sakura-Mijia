@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import logging
 import re
@@ -12,6 +13,9 @@ from urllib.parse import quote
 import requests
 import qrcode
 from mijiaAPI import apis
+from mijiaAPI.miutils import gen_nonce, generate_enc_params, get_signed_nonce
+
+from .storage import atomic_write
 
 
 class PluginError(Exception):
@@ -125,6 +129,34 @@ class Cloud:
     def __init__(self, root: Path, auth: dict, persist):
         self.api = _API(root, auth, persist)
         self.specs = {}
+        self.image_root = root / "images"
+
+    def image(self, model: str):
+        cache = self.image_root / (quote(model, safe="") + ".json")
+        try:
+            value = json.loads(cache.read_text("utf-8"))
+            if isinstance(value, str) and value.startswith("data:image/"):
+                return value
+        except (OSError, ValueError):
+            pass
+        # 产品图片接口以重定向返回地址，签名复用米家协议实现。
+        uri = "/v2/productconfig/get_icon"
+        self.api._refresh_token()
+        nonce = gen_nonce()
+        security = self.api.auth_data["ssecurity"]
+        params = generate_enc_params(uri, "POST", get_signed_nonce(security, nonce), nonce,
+                                     {"data": json.dumps({"icon_name": "icon_real", "model": model}, separators=(",", ":"))}, security)
+        response = self.api.session.post(self.api.api_base_url + uri, data=params, allow_redirects=False)
+        if response.status_code != 302 or not response.headers.get("Location"):
+            raise PluginError("IMAGE_UNAVAILABLE", f"产品图片不可用（HTTP {response.status_code}）。")
+        # 图片下载使用独立请求，不能把账号 Cookie 带到 CDN。
+        image = _Requests.get(response.headers["Location"])
+        mime = image.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            raise PluginError("IMAGE_UNAVAILABLE", "产品接口没有返回可显示的图片。")
+        value = f"data:{mime};base64," + base64.b64encode(image.content).decode("ascii")
+        atomic_write(cache, json.dumps(value).encode("utf-8"))
+        return value
 
     def login(self, on_qr):
         data = self.api._get_qr_login_data()

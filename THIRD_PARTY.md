@@ -15,6 +15,8 @@
 
 ## 其他依赖
 
+设备图片接口的接入方式参考 [MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows/blob/main/app/core/service.py)（GPL-3.0-or-later）。产品图片由米家服务按型号提供，安装包不内置产品图。界面按 Sakura 的插件设置接口实现，没有引入该项目的 Qt 或 SiliconUI 组件。
+
 依赖版本见 `requirements.lock`。requests、urllib3、certifi、charset-normalizer、idna、
 Pillow、qrcode、pycryptodome、tzlocal、tzdata、colorama 由安装器安装，保留各自包内的许可证。
 未随安装包嵌入第三方依赖二进制。二维码使用 qrcode/Pillow 在本机生成。

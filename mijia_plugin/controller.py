@@ -57,6 +57,9 @@ class Controller:
         self.closed = False
         self.cloud = None
         self.worker = None
+        self.image_worker = None
+        self.image_epoch = None
+        self.images = {}
         self.devices = {}
         self.scenes = {}
         self.qr = None
@@ -108,7 +111,7 @@ class Controller:
 
     def snapshot(self):
         with self.lock:
-            return {**self.status(), "devices": [dict(d, **self.policy["devices"].get(did, {"mode": "hidden", "alias": ""}))
+            return {**self.status(), "devices": [dict(d, image=self.images.get(d["model"]), **self.policy["devices"].get(did, {"mode": "hidden", "alias": ""}))
                     for did, d in self.devices.items()],
                     "scenes": [dict(s, allowed=key in self.policy["scenes"]) for key, s in self.scenes.items()]}
 
@@ -196,24 +199,83 @@ class Controller:
                 keep = self.cloud is client and epoch == self.epoch and not self.closed
             if client and not keep:
                 client.close()
+            if keep and not problem:
+                self._start_images(epoch, cancel)
+
+    def _start_images(self, epoch, cancel):
+        with self.lock:
+            if self.closed or epoch != self.epoch:
+                return
+            if self.image_worker and self.image_worker.is_alive() and self.image_epoch == epoch:
+                return
+            models = list(dict.fromkeys(d["model"] for d in self.devices.values() if d["model"] and d["model"] not in self.images))
+            if not models:
+                return
+            auth = self.vault.read()
+            self.image_epoch = epoch
+            self.image_worker = threading.Thread(target=self._load_images, args=(models, auth, epoch, cancel), daemon=True, name="mijia-images")
+            self.image_worker.start()
+
+    def _load_images(self, models, auth, epoch, cancel):
+        # 图片使用独立连接，下载时设备查询和控制仍可执行。
+        client = None
+        completed = 0
+        self.logger.info("米家开始加载设备图片", fields={"model_count": len(models)})
+        try:
+            with network_scope(cancel):
+                client = self.factory(self.root, auth, lambda value: self._persist(epoch, value))
+                for index, model in enumerate(models):
+                    if cancel.is_set():
+                        return
+                    problem = None
+                    try:
+                        image = client.image(model)
+                    except Exception as error:
+                        problem = public_error(error)
+                    if cancel.is_set():
+                        return
+                    if problem:
+                        self.logger.warning("米家设备图片未加载", fields={"model": model, **problem})
+                        continue
+                    with self.lock:
+                        self._active(epoch)
+                        self.images[model] = image
+                    completed += 1
+                    self.logger.info("米家设备图片已加载", fields={"model": model, "progress": index + 1, "total": len(models)})
+        except Exception as error:
+            problem = public_error(error)
+        else:
+            problem = None
+        finally:
+            if client:
+                client.close()
+            if not cancel.is_set():
+                if problem:
+                    self.logger.warning("米家设备图片加载失败", fields=problem)
+                self.logger.info("米家设备图片加载结束", fields={"loaded": completed, "total": len(models)})
 
     def save_permissions(self, value):
         with self.lock:
             if not self.connected:
                 raise PluginError("LOGIN_REQUIRED", "请先扫码登录。")
-            devices, scenes = value["devices"], value["scenes"]
-            clean = {}
-            for did, rule in devices.items():
-                if did not in self.devices or rule["mode"] not in ("hidden", "read", "control"):
-                    raise PluginError("INVALID_PERMISSIONS", "设备列表已变化，请刷新后重试。")
-                alias = rule.get("alias", "")
-                if rule["mode"] != "hidden" or alias.strip():
-                    clean[did] = {"mode": rule["mode"], "alias": alias.strip()}
-            if any(key not in self.scenes for key in scenes):
-                raise PluginError("INVALID_PERMISSIONS", "场景列表已变化，请刷新后重试。")
-            self.policy = {**self.policy, "devices": clean, "scenes": scenes}
+            changes = {}
+            if "devices" in value:
+                # 目录暂缺的对象不在本次编辑范围内。
+                clean = {did: rule for did, rule in self.policy["devices"].items() if did not in self.devices}
+                for did, rule in value["devices"].items():
+                    if did not in self.devices or rule["mode"] not in ("hidden", "read", "control"):
+                        raise PluginError("INVALID_PERMISSIONS", "设备列表已变化，请刷新后重试。")
+                    alias = rule.get("alias", "").strip()
+                    if rule["mode"] != "hidden" or alias:
+                        clean[did] = {"mode": rule["mode"], "alias": alias}
+                changes["devices"] = clean
+            if "scenes" in value:
+                if any(key not in self.scenes for key in value["scenes"]):
+                    raise PluginError("INVALID_PERMISSIONS", "场景列表已变化，请刷新后重试。")
+                changes["scenes"] = [key for key in self.policy["scenes"] if key not in self.scenes] + value["scenes"]
+            self.policy = {**self.policy, **changes}
             self._save_policy()
-            self.logger.info("米家桌宠权限已保存", fields={"device_count": len(clean), "scene_count": len(scenes)})
+            self.logger.info("米家桌宠权限已保存", fields={"device_count": len(self.policy["devices"]), "scene_count": len(self.policy["scenes"])})
             return {"saved": True}
 
     def logout(self):
@@ -413,4 +475,6 @@ class Controller:
             client.close()
         if self.worker:
             self.worker.join(timeout=1)
+        if self.image_worker:
+            self.image_worker.join(timeout=1)
         self.logger.info("米家插件已停止")

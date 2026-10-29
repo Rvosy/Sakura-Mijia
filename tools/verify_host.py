@@ -77,10 +77,11 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
         item = next(p for p in snapshot["plugins"] if p["pluginId"] == "dev.sakura.mijia")
         assert item["state"] == "active" and item["sections"]
         sections = {s['sectionId']: s for s in item['sections']}
-        assert set(sections) == {'connection', 'devices', 'scenes'}
+        assert set(sections) == {'connection', 'workspace'}
         assert all(s['reasonCode'] == 'READY' for s in sections.values()), sections
         assert sections['connection']['fields'][1]['type'] == 'image'
-        assert sections['devices']['presentation']['component'] == 'record-table'
+        assert sections['workspace']['presentation']['component'] == 'module'
+        assert sections['workspace']['values']['visible'] is False
         if args.live_qr:
             host.settings_action('dev.sakura.mijia', 'connection', 'login', {})
             deadline = time.monotonic() + 40
