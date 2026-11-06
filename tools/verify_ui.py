@@ -35,7 +35,7 @@ workspace = dict(sectionId="workspace", title="设备与场景", reasonCode="REA
     values=dict(items=devices, sceneItems=[dict(id="night", label="晚安", description="我的家")],
                 grants={}, sceneGrants={}, visible=True, request={}, result={}))
 data = dict(schemaVersion=1, state="ready", reasonCode="READY", windowGeneration=1, coreGenerationId="fixture", plugins=[dict(
-    installId="mijia-ui", pluginId="dev.sakura.mijia", name="米家", version="0.3.1", author="Sakura Community", description="米家设备",
+    installId="mijia-ui", pluginId="dev.sakura.mijia", name="米家", version="0.3.2", author="Sakura Community", description="米家设备",
     enabled=True, required=False, supported=True, source="user", canUninstall=True, provides=["dev.sakura.mijia"], requires=[],
     missingServices=[], state="active", reasonCode="ACTIVE", sections=[connection, workspace],
     presentation=dict(kind="extension", category="connectivity", icon="link"))])

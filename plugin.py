@@ -4,7 +4,7 @@ import base64
 import threading
 from pathlib import Path
 
-from mijia_plugin.controller import Controller, public_error
+from mijia_plugin.controller import Controller
 
 
 def tool_definitions():
@@ -30,7 +30,7 @@ class MijiaPlugin:
     def setup(self, context):
         self.read_result = None
         self.read_worker = None
-        self.controller = Controller(context.data_path("connection"), logger=context.get("sakura.host.logging"))
+        self.controller = Controller(context.data_path("connection"), logger=context.get("sakura.host.logging"), diagnose=context.exception_diagnostics)
         context.effect(self.close)
         context.provide("dev.sakura.mijia", self, exports=("status",))
         settings = context.get("sakura.host.settings")
@@ -83,9 +83,12 @@ class MijiaPlugin:
             try:
                 return callback(values)
             except Exception as error:
-                problem = public_error(error)
+                problem = self.controller.error_details(error)
             self.controller.report_error("米家设置操作失败", problem)
-            raise RuntimeError(problem["message"]) from None
+            failure = RuntimeError(problem["message"])
+            failure.code = problem["code"]
+            failure.diagnostics = problem["diagnostics"]
+            raise failure from None
         return run
 
     def connection_action(self, key):
@@ -123,7 +126,7 @@ class MijiaPlugin:
                 try:
                     outcome = {**self.controller.read_for_user(did), "state": "completed"}
                 except Exception as error:
-                    problem = public_error(error)
+                    problem = self.controller.error_details(error)
                     outcome = {"state": "failed", "message": problem["message"]}
                 if problem:
                     self.controller.report_error("米家手动读取设备状态失败", problem)

@@ -14,6 +14,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--sakura", required=True, type=Path)
+parser.add_argument("--app-version", help="仅为隔离测试目录指定宿主版本")
 parser.add_argument("--live-qr", action="store_true", help="在临时账号根验证真实二维码，不扫码登录")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
@@ -47,14 +48,17 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
     work = Path(temporary)
     distribution = work / "distribution"
     (distribution / "plugins/builtin").mkdir(parents=True)
-    shutil.copy2(args.sakura / "VERSION", distribution / "VERSION")
+    if args.app_version:
+        (distribution / "VERSION").write_text(args.app_version, encoding="utf-8")
+    else:
+        shutil.copy2(args.sakura / "VERSION", distribution / "VERSION")
     uv_dir = distribution / "python/tools"
     uv_dir.mkdir(parents=True)
     uv_name = "uv.exe" if os.name == "nt" else "uv"
     uv_source = args.sakura / "runtime" / ("Scripts" if os.name == "nt" else "bin") / uv_name
     shutil.copy2(uv_source, uv_dir / uv_name)
     roots = RuntimeRoots(distribution, work / "user")
-    record = LocalPluginInstaller(roots).install(root / "dist/Sakura-Mijia-0.3.1.sakplugin.zip", "zip", initial_enabled=True)
+    record = LocalPluginInstaller(roots).install(root / "dist/Sakura-Mijia-0.3.2.sakplugin.zip", "zip", initial_enabled=True)
     registry = ToolRegistry()
     log_output = LogOutput()
     bridge = install_runtime_logging(log_output)
