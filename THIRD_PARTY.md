@@ -8,12 +8,15 @@
 - 用途：米家扫码登录、账号凭据刷新、米家云设备及场景调用。
 - 接入：通过依赖安装，不复制或修改上游发行包；插件适配层为上游请求补充超时和取消检查，并接管凭据持久化。
 - 上游登录 API 中的 `_get_qr_login_data` / `_complete_qr_login` 是私有方法，因此固定依赖版本并通过适配测试约束升级。
+- 设备规格直接使用小米 `miot-spec.org/miot-spec-v2/instance` 接口，按设备目录中的完整 `spec_type` 查询；接入方式参考上游 [v5.0.0 的规格迁移](https://github.com/Do1e/mijia-api/blob/v5.0.0/mijiaAPI/devices.py)，保留属性范围、枚举、动作参数和中文注释。
 
 上游 README 除 GPL-3.0 外，还写有“仅供学习交流使用，不得用于商业用途”的声明。
 此个人预览版保留这一事实；商业使用或随产品公开分发前应向上游澄清额外声明，不能把本项目当成小米官方开放 API 授权。
 插件对自身新增代码采用 GPL-3.0，完整文本见 `LICENSE`。
 
 ## 其他依赖
+
+设备图片接口的接入方式参考 [MiHome-Windows](https://github.com/huanyuejue/MiHome-Windows/blob/main/app/core/service.py)（GPL-3.0-or-later）。产品图片由米家服务按型号提供，安装包不内置产品图。界面按 Sakura 的插件设置接口实现，没有引入该项目的 Qt 或 SiliconUI 组件。
 
 依赖版本见 `requirements.lock`。requests、urllib3、certifi、charset-normalizer、idna、
 Pillow、qrcode、pycryptodome、tzlocal、tzdata、colorama 由安装器安装，保留各自包内的许可证。

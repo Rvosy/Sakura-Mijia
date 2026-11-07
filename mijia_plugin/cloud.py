@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import logging
-import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +12,9 @@ from urllib.parse import quote
 import requests
 import qrcode
 from mijiaAPI import apis
+from mijiaAPI.miutils import gen_nonce, generate_enc_params, get_signed_nonce
+
+from .storage import atomic_write
 
 
 class PluginError(Exception):
@@ -88,22 +91,20 @@ class _API(apis.mijiaAPI):
 
 
 def parse_spec(content: dict) -> dict:
-    props = content["props"]
-    translations = props.get("i18n", {}).get("zh_cn", {})
     result = {"properties": [], "actions": []}
-    for service in props["tree"]["services"]:
+    for service in content["services"]:
         siid = service["iid"]
         by_id = {}
         for prop in service.get("properties", []):
             piid = prop["iid"]
             item = {
                 "key": f"{siid}.{piid}", "name": prop["type"],
-                "service": translations.get(f"service:{siid:03d}") or service.get("description", service.get("type", "")),
-                "description": translations.get(f"service:{siid:03d}:property:{piid:03d}") or prop.get("description", ""),
+                "service": service.get("comment") or service.get("description", service["type"]),
+                "description": prop.get("comment") or prop.get("description", ""),
                 "format": prop["format"], "access": prop["access"],
-                "range": prop.get("valueRange"),
-                "values": [{"value": v["value"], "label": translations.get(v.get("i18nKey", "")) or v.get("description", str(v["value"]))}
-                           for v in prop.get("valueList", [])],
+                "range": prop.get("value-range"),
+                "values": [{"value": v["value"], "label": v.get("comment") or v.get("description", str(v["value"]))}
+                           for v in prop.get("value-list", [])],
                 "unit": prop.get("unit"), "siid": siid, "piid": piid,
             }
             by_id[piid] = item
@@ -114,7 +115,7 @@ def parse_spec(content: dict) -> dict:
             inputs = action.get("in", [])
             result["actions"].append({
                 "key": f"{siid}.{aiid}", "name": action["type"],
-                "description": translations.get(f"service:{siid:03d}:action:{aiid:03d}") or action.get("description", ""),
+                "description": action.get("comment") or action.get("description", ""),
                 "siid": siid, "aiid": aiid,
                 "inputs": [by_id.get(i, {"piid": i}) for i in inputs],
             })
@@ -125,6 +126,37 @@ class Cloud:
     def __init__(self, root: Path, auth: dict, persist):
         self.api = _API(root, auth, persist)
         self.specs = {}
+        self.image_root = root / "images"
+
+    def diagnostic_secrets(self):
+        return tuple(value for value in self.api.auth_data.values() if isinstance(value, str))
+
+    def image(self, model: str):
+        cache = self.image_root / (quote(model, safe="") + ".json")
+        try:
+            value = json.loads(cache.read_text("utf-8"))
+            if isinstance(value, str) and value.startswith("data:image/"):
+                return value
+        except (OSError, ValueError):
+            pass
+        # 产品图片接口以重定向返回地址，签名复用米家协议实现。
+        uri = "/v2/productconfig/get_icon"
+        self.api._refresh_token()
+        nonce = gen_nonce()
+        security = self.api.auth_data["ssecurity"]
+        params = generate_enc_params(uri, "POST", get_signed_nonce(security, nonce), nonce,
+                                     {"data": json.dumps({"icon_name": "icon_real", "model": model}, separators=(",", ":"))}, security)
+        response = self.api.session.post(self.api.api_base_url + uri, data=params, allow_redirects=False)
+        if response.status_code != 302 or not response.headers.get("Location"):
+            raise PluginError("IMAGE_UNAVAILABLE", f"产品图片不可用（HTTP {response.status_code}）。")
+        # 图片下载使用独立请求，不能把账号 Cookie 带到 CDN。
+        image = _Requests.get(response.headers["Location"])
+        mime = image.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            raise PluginError("IMAGE_UNAVAILABLE", "产品接口没有返回可显示的图片。")
+        value = f"data:{mime};base64," + base64.b64encode(image.content).decode("ascii")
+        atomic_write(cache, json.dumps(value).encode("utf-8"))
+        return value
 
     def login(self, on_qr):
         data = self.api._get_qr_login_data()
@@ -132,7 +164,11 @@ class Cloud:
             out = io.BytesIO()
             qrcode.make(data["loginUrl"]).save(out, format="PNG")
             on_qr(out.getvalue())
-            self.api._complete_qr_login(data)
+            try:
+                self.api._complete_qr_login(data)
+            except Exception as error:
+                error.diagnostic_secrets = tuple(value for value in data.values() if isinstance(value, str))
+                raise
 
     def reconnect(self):
         self.api.check_new_msg()
@@ -153,6 +189,7 @@ class Cloud:
                 continue
             home, room = location.get(did, (home_names.get(str(device.get("home_id")), "共享设备"), "未分配房间"))
             clean[did] = {"did": did, "name": str(device.get("name", did)), "model": str(device.get("model", "")),
+                          "spec_type": device.get("spec_type"),
                           "home": home, "room": room, "online": device.get("isOnline")}
         return clean
 
@@ -161,14 +198,14 @@ class Cloud:
                 "name": str(s["name"]), "home_id": str(s["home_id"]), "scene_id": str(s["scene_id"])}
                 for s in self.api.get_scenes_list()}
 
-    def spec(self, model: str):
-        if model not in self.specs:
-            response = _Requests.get("https://home.miot-spec.com/spec/" + quote(model, safe="."))
-            match = re.search(r'<script data-page="app" type="application/json">(.*?)</script>', response.text, re.S)
-            if not match:
-                raise PluginError("SPEC_UNAVAILABLE", "此设备的能力描述暂不可用。")
-            self.specs[model] = parse_spec(json.loads(match.group(1)))
-        return self.specs[model]
+    def spec(self, device: dict):
+        spec_type = device.get("spec_type")
+        if not spec_type:
+            raise PluginError("SPEC_UNAVAILABLE", f"米家未提供设备 {device['name']} 的 MIoT 规格类型。")
+        if spec_type not in self.specs:
+            response = _Requests.get("https://miot-spec.org/miot-spec-v2/instance", params={"type": spec_type})
+            self.specs[spec_type] = parse_spec(response.json())
+        return self.specs[spec_type]
 
     def read(self, did, props):
         return self.api.get_devices_prop([{"did": did, "siid": p["siid"], "piid": p["piid"]} for p in props])

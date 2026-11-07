@@ -15,7 +15,27 @@ from .storage import Vault, atomic_write
 from .state_view import state_rows
 
 
-def public_error(error: Exception) -> dict:
+_AUTH_FIELD = re.compile(r'''(?ix)\b(?:serviceToken|passToken|ssecurity|psecurity|cUserId|userId|nonce|pass_o|deviceId|_sign|qs)["']?\s*[:=]\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s,;}&]+))''')
+
+
+def public_error(error: Exception, *, diagnose, secrets=()) -> dict:
+    # 小米认证字段不在宿主的通用凭据名称中，交给同一诊断入口清洗。
+    secrets = list(secrets)
+    current, seen = error, set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        secrets.extend(getattr(current, "diagnostic_secrets", ()))
+        secrets.extend(next(value for value in match.groups() if value is not None) for match in _AUTH_FIELD.finditer(str(current)))
+        current = current.__cause__ if current.__cause__ is not None else (None if current.__suppress_context__ else current.__context__)
+    diagnostics = diagnose(error, secrets=secrets)
+    problem = _error_category(error)
+    original = diagnostics["diagnostic"]
+    if original and original != problem["message"]:
+        problem["message"] += "\n" + original
+    return {**problem, "diagnostics": diagnostics}
+
+
+def _error_category(error: Exception) -> dict:
     if isinstance(error, PluginError):
         return {"code": error.code, "message": str(error)}
     if isinstance(error, requests.Timeout):
@@ -30,7 +50,6 @@ def public_error(error: Exception) -> dict:
     if isinstance(error, APIError):
         code = re.search(r"code[:：= ]+(-?\d+)", str(error), re.I)
         return {"code": "MIJIA_API_ERROR", "message": "米家服务拒绝了请求。", "serviceCode": code.group(1) if code else None}
-    # Do not expose raw upstream exceptions: they may contain cookies or response bodies.
     return {"code": "PLUGIN_ERROR", "message": "操作失败。", "exceptionType": type(error).__name__}
 
 
@@ -42,7 +61,7 @@ def _matches(items, key):
 
 
 class Controller:
-    def __init__(self, root: Path, *, logger, cloud_factory=Cloud):
+    def __init__(self, root: Path, *, logger, diagnose, cloud_factory=Cloud):
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
         self.vault = Vault(root)
@@ -50,6 +69,7 @@ class Controller:
         self.policy = json.loads(self.policy_path.read_text("utf-8")) if self.policy_path.exists() else {"account": "", "devices": {}, "scenes": []}
         self.factory = cloud_factory
         self.logger = logger
+        self.diagnose = diagnose
         self.lock = threading.RLock()
         self.io_lock = threading.Lock()
         self.cancel = threading.Event()
@@ -57,6 +77,9 @@ class Controller:
         self.closed = False
         self.cloud = None
         self.worker = None
+        self.image_worker = None
+        self.image_epoch = None
+        self.images = {}
         self.devices = {}
         self.scenes = {}
         self.qr = None
@@ -78,10 +101,16 @@ class Controller:
         # upstream exception text, which may contain authentication responses.
         emit = self.logger.info if problem["code"] == "CANCELLED" else self.logger.error
         emit(f"{message}：{problem['message']}", fields={"reason_code": problem["code"],
-             **{k: v for k, v in problem.items() if k not in ("code", "message")}, **fields})
+             **{k: v for k, v in problem.items() if k not in ("code", "message", "diagnostics")},
+             **problem.get("diagnostics", {}), **fields})
 
-    def _save_policy(self):
-        atomic_write(self.policy_path, json.dumps(self.policy, ensure_ascii=False, indent=2).encode("utf-8"))
+    def error_details(self, error, client=None):
+        client = client or self.cloud
+        return public_error(error, diagnose=self.diagnose, secrets=client.diagnostic_secrets() if client else ())
+
+    def _save_policy(self, policy):
+        atomic_write(self.policy_path, json.dumps(policy, ensure_ascii=False, indent=2).encode("utf-8"))
+        self.policy = policy
 
     def _active(self, epoch):
         if self.closed or epoch != self.epoch or self.cancel.is_set():
@@ -92,8 +121,7 @@ class Controller:
             self._active(epoch)
             uid = str(auth["userId"])
             if self.policy["account"] != uid:
-                self.policy = {"account": uid, "devices": {}, "scenes": []}
-                self._save_policy()
+                self._save_policy({"account": uid, "devices": {}, "scenes": []})
             self.vault.save(auth)
 
     def status(self):
@@ -108,7 +136,7 @@ class Controller:
 
     def snapshot(self):
         with self.lock:
-            return {**self.status(), "devices": [dict(d, **self.policy["devices"].get(did, {"mode": "hidden", "alias": ""}))
+            return {**self.status(), "devices": [dict(d, image=self.images.get(d["model"]), **self.policy["devices"].get(did, {"mode": "hidden", "alias": ""}))
                     for did, d in self.devices.items()],
                     "scenes": [dict(s, allowed=key in self.policy["scenes"]) for key, s in self.scenes.items()]}
 
@@ -127,15 +155,15 @@ class Controller:
             if kind in ("login", "reconnect"):
                 self.login_state = "starting"
             self.logger.info({"login": "米家开始扫码登录", "reconnect": "米家正在恢复连接", "refresh": "米家正在刷新设备和场景"}[kind])
-            self.worker = threading.Thread(target=self._background, args=(kind, epoch, cancel), daemon=True, name="mijia-connection")
+            self.worker = threading.Thread(target=self._background, args=(kind, epoch, cancel, self.io_lock), daemon=True, name="mijia-connection")
             self.worker.start()
             return self.status()
 
-    def _background(self, kind, epoch, cancel):
+    def _background(self, kind, epoch, cancel, io_lock):
         client = None
         problem = None
         try:
-            with self.io_lock, network_scope(cancel):
+            with io_lock, network_scope(cancel):
                 with self.lock:
                     self._active(epoch)
                     client = self.cloud if kind == "refresh" else None
@@ -172,7 +200,7 @@ class Controller:
                     scenes = client.scenes()
                     scene_error = None
                 except Exception as error:
-                    scenes, scene_error = {}, public_error(error)
+                    scenes, scene_error = {}, self.error_details(error, client)
                 with self.lock:
                     self._active(epoch)
                     self.scenes = scenes
@@ -183,7 +211,7 @@ class Controller:
         except Exception as error:
             with self.lock:
                 if epoch == self.epoch and not self.closed:
-                    problem = self.error = public_error(error)
+                    problem = self.error = self.error_details(error, client)
                     self.qr = None
                     if not self.connected:
                         self.login_state = "error"
@@ -196,24 +224,82 @@ class Controller:
                 keep = self.cloud is client and epoch == self.epoch and not self.closed
             if client and not keep:
                 client.close()
+            if keep and not problem:
+                self._start_images(epoch, cancel)
+
+    def _start_images(self, epoch, cancel):
+        with self.lock:
+            if self.closed or epoch != self.epoch:
+                return
+            if self.image_worker and self.image_worker.is_alive() and self.image_epoch == epoch:
+                return
+            models = list(dict.fromkeys(d["model"] for d in self.devices.values() if d["model"] and d["model"] not in self.images))
+            if not models:
+                return
+            auth = self.vault.read()
+            self.image_epoch = epoch
+            self.image_worker = threading.Thread(target=self._load_images, args=(models, auth, epoch, cancel), daemon=True, name="mijia-images")
+            self.image_worker.start()
+
+    def _load_images(self, models, auth, epoch, cancel):
+        # 图片使用独立连接，下载时设备查询和控制仍可执行。
+        client = None
+        completed = 0
+        self.logger.info("米家开始加载设备图片", fields={"model_count": len(models)})
+        try:
+            with network_scope(cancel):
+                client = self.factory(self.root, auth, lambda value: self._persist(epoch, value))
+                for index, model in enumerate(models):
+                    if cancel.is_set():
+                        return
+                    problem = None
+                    try:
+                        image = client.image(model)
+                    except Exception as error:
+                        problem = self.error_details(error, client)
+                    if cancel.is_set():
+                        return
+                    if problem:
+                        self.logger.warning("米家设备图片未加载", fields={"model": model, "reason_code": problem["code"], **problem["diagnostics"]})
+                        continue
+                    with self.lock:
+                        self._active(epoch)
+                        self.images[model] = image
+                    completed += 1
+                    self.logger.info("米家设备图片已加载", fields={"model": model, "progress": index + 1, "total": len(models)})
+        except Exception as error:
+            problem = self.error_details(error, client)
+        else:
+            problem = None
+        finally:
+            if client:
+                client.close()
+            if not cancel.is_set():
+                if problem:
+                    self.logger.warning("米家设备图片加载失败", fields={"reason_code": problem["code"], **problem["diagnostics"]})
+                self.logger.info("米家设备图片加载结束", fields={"loaded": completed, "total": len(models)})
 
     def save_permissions(self, value):
         with self.lock:
             if not self.connected:
                 raise PluginError("LOGIN_REQUIRED", "请先扫码登录。")
-            devices, scenes = value["devices"], value["scenes"]
-            clean = {}
-            for did, rule in devices.items():
-                if did not in self.devices or rule["mode"] not in ("hidden", "read", "control"):
-                    raise PluginError("INVALID_PERMISSIONS", "设备列表已变化，请刷新后重试。")
-                alias = rule.get("alias", "")
-                if rule["mode"] != "hidden" or alias.strip():
-                    clean[did] = {"mode": rule["mode"], "alias": alias.strip()}
-            if any(key not in self.scenes for key in scenes):
-                raise PluginError("INVALID_PERMISSIONS", "场景列表已变化，请刷新后重试。")
-            self.policy = {**self.policy, "devices": clean, "scenes": scenes}
-            self._save_policy()
-            self.logger.info("米家桌宠权限已保存", fields={"device_count": len(clean), "scene_count": len(scenes)})
+            changes = {}
+            if "devices" in value:
+                # 目录暂缺的对象不在本次编辑范围内。
+                clean = {did: rule for did, rule in self.policy["devices"].items() if did not in self.devices}
+                for did, rule in value["devices"].items():
+                    if did not in self.devices or rule["mode"] not in ("hidden", "read", "control"):
+                        raise PluginError("INVALID_PERMISSIONS", "设备列表已变化，请刷新后重试。")
+                    alias = rule.get("alias", "").strip()
+                    if rule["mode"] != "hidden" or alias:
+                        clean[did] = {"mode": rule["mode"], "alias": alias}
+                changes["devices"] = clean
+            if "scenes" in value:
+                if any(key not in self.scenes for key in value["scenes"]):
+                    raise PluginError("INVALID_PERMISSIONS", "场景列表已变化，请刷新后重试。")
+                changes["scenes"] = [key for key in self.policy["scenes"] if key not in self.scenes] + value["scenes"]
+            self._save_policy({**self.policy, **changes})
+            self.logger.info("米家桌宠权限已保存", fields={"device_count": len(self.policy["devices"]), "scene_count": len(self.policy["scenes"])})
             return {"saved": True}
 
     def logout(self):
@@ -222,6 +308,8 @@ class Controller:
             self.cancel.set()
             self.epoch += 1
             self.cancel = threading.Event()
+            # 取消的长轮询仍归旧连接回收，新登录使用自己的请求锁。
+            self.io_lock = threading.Lock()
             old = self.cloud
             self.cloud = None
             self.connected = self.busy = False
@@ -231,8 +319,7 @@ class Controller:
             self.devices, self.scenes = {}, {}
             self.last_refresh = None
             self.vault.clear()
-            self.policy = {"account": "", "devices": {}, "scenes": []}
-            self._save_policy()
+            self._save_policy({"account": "", "devices": {}, "scenes": []})
         if old:
             old.close()
         self.logger.info("米家已退出登录，凭据和桌宠权限已清除" if connected else "米家登录已取消")
@@ -248,27 +335,32 @@ class Controller:
     def _operation(self):
         with self.lock:
             epoch, cancel = self.epoch, self.cancel
+            io_lock = self.io_lock
             self._active(epoch)
             if not self.connected:
                 raise PluginError("LOGIN_REQUIRED", "请在米家插件设置中扫码登录。")
-        if not self.io_lock.acquire(blocking=False):
+        if not io_lock.acquire(blocking=False):
             raise PluginError("BUSY", "米家正在处理另一个请求，请稍后再试。")
         try:
             with self.lock:
                 self._active(epoch)
                 client = self.cloud
             with network_scope(cancel):
-                yield client, epoch
+                try:
+                    yield client, epoch
+                except Exception as error:
+                    error.diagnostic_secrets = (*getattr(error, "diagnostic_secrets", ()), *client.diagnostic_secrets())
+                    raise
             with self.lock:
                 self._active(epoch)
         finally:
-            self.io_lock.release()
+            io_lock.release()
 
     def tool(self, name, args):
         try:
             result = self._tool(name, args)
         except Exception as error:
-            problem = public_error(error)
+            problem = self.error_details(error)
             result = {"ok": False, "error": problem}
         operation = {"status": "查询连接状态", "devices": "查询设备列表", "capabilities": "查询设备能力",
                      "read": "读取设备状态", "write": "设置设备属性", "action": "执行设备动作",
@@ -291,7 +383,7 @@ class Controller:
                 if did not in self.devices:
                     raise PluginError("DEVICE_NOT_FOUND", "设备列表已变化，请刷新设备。")
                 device = dict(self.devices[did])
-            spec = client.spec(device["model"])
+            spec = client.spec(device)
             with self.lock:
                 self._active(epoch)
             props = [p for p in spec["properties"] if "read" in p["access"]]
@@ -338,7 +430,7 @@ class Controller:
                 did = args.get("device")
                 with self.lock:
                     device = self._device(did, name in ("write", "action"))
-                spec = client.spec(device["model"])
+                spec = client.spec(device)
                 # Authorization is checked again after the network/spec lookup.
                 with self.lock:
                     self._active(epoch)
@@ -365,7 +457,7 @@ class Controller:
                             result["observed"] = observed
                             result["confirmed"] = observed["code"] == 0 and type(observed.get("value")) is type(value) and observed.get("value") == value
                         except Exception as error:
-                            result["readbackError"] = public_error(error)
+                            result["readbackError"] = self.error_details(error, client)
                     if result["ok"]:
                         result["message"] = "已读回目标状态。" if result.get("confirmed") else "指令已被接收，设备状态尚未确认。"
                 elif name == "action":
@@ -413,4 +505,6 @@ class Controller:
             client.close()
         if self.worker:
             self.worker.join(timeout=1)
+        if self.image_worker:
+            self.image_worker.join(timeout=1)
         self.logger.info("米家插件已停止")

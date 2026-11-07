@@ -7,6 +7,7 @@ import threading
 
 import pytest
 import requests
+from sakura_plugin_sdk import exception_diagnostics
 
 from mijia_plugin.cloud import PluginError, TimedSession, network_scope, parse_spec
 from mijia_plugin.controller import Controller, public_error
@@ -50,6 +51,9 @@ class FakeCloud:
         callback(b"test-qr")
         self.persist({"userId": self.uid, "serviceToken": "private-token-test"})
 
+    def diagnostic_secrets(self):
+        return ("private-token-test",)
+
     def reconnect(self):
         pass
 
@@ -60,7 +64,10 @@ class FakeCloud:
     def scenes(self):
         return {"h:1": {"key": "h:1", "name": "回家", "home_id": "h", "scene_id": "1"}}
 
-    def spec(self, model):
+    def image(self, model):
+        return "data:image/png;base64,iVBORw0KGgo="
+
+    def spec(self, device):
         if self.spec_hook:
             self.spec_hook()
         return {"properties": [copy.deepcopy(PROPERTY)], "actions": [
@@ -91,9 +98,10 @@ class FakeCloud:
 
 @pytest.fixture
 def controller(tmp_path):
-    c = Controller(tmp_path, cloud_factory=FakeCloud, logger=RecordingLogger())
+    c = Controller(tmp_path, cloud_factory=FakeCloud, logger=RecordingLogger(), diagnose=exception_diagnostics)
     c.start("login")
     c.worker.join(3)
+    c.image_worker.join(3)
     assert c.connected and not c.busy
     yield c
     c.close()
@@ -156,30 +164,58 @@ def test_native_read_returns_immediately_and_polls_without_saving_grants(control
         assert plugin.start_read(request)["values"]["result"]["state"] == "running"
         assert entered.wait(3)
         assert plugin.read_status(request)["values"]["result"]["state"] == "running"
-        assert plugin.records("devices")["grants"]["secret"]["mode"] == "hidden"
+        assert plugin.workspace()["grants"]["secret"]["mode"] == "hidden"
     finally:
         finish.set()
         plugin.read_worker.join(3)
     result = plugin.read_status(request)["values"]["result"]
     assert result["state"] == "completed" and result["rows"][0]["value"] == "关"
-    plugin.save_records("devices", {"grants": {"lamp": {"mode": "read", "alias": "台灯"}}})
-    plugin.save_records("scenes", {"grants": {"h:1": {"allowed": True}}})
+    plugin.save_workspace({"grants": {"lamp": {"mode": "read", "alias": "台灯"}}})
+    plugin.save_workspace({"sceneGrants": {"h:1": {"allowed": True}}})
     assert controller.policy["devices"]["lamp"]["mode"] == "read"
     assert controller.policy["scenes"] == ["h:1"]
 
 
-def test_connection_actions_and_records_follow_login_state(controller):
+def test_connection_actions_and_workspace_follow_login_state(controller):
     from plugin import MijiaPlugin
     plugin = MijiaPlugin()
     plugin.controller = controller
     assert plugin.settings()["available"] == ["refresh", "logout"]
-    assert plugin.records("devices")["visible"] is True
+    assert plugin.workspace()["visible"] is True
     controller.logout()
     assert plugin.settings()["available"] == ["login"]
-    assert plugin.records("devices")["visible"] is False
+    assert plugin.workspace()["visible"] is False
     controller.busy, controller.login_state, controller.qr = True, "waiting", b"fixture"
     assert plugin.settings()["available"] == ["cancel"]
     assert plugin.settings()["qr"] is not None
+
+
+@pytest.mark.parametrize("unavailable, changes", [
+    ("scenes", {"grants": {"lamp": {"mode": "read", "alias": "新别名"}}}),
+    ("devices", {"sceneGrants": {"h:1": {"allowed": False}}}),
+])
+@pytest.mark.parametrize("whole_section", [False, True])
+def test_settings_save_preserves_unavailable_permissions(controller, unavailable, changes, whole_section):
+    from plugin import MijiaPlugin
+    plugin = MijiaPlugin()
+    plugin.controller = controller
+    grant(controller, scenes=["h:1"])
+    previous = copy.deepcopy(controller.policy[unavailable])
+    setattr(controller, unavailable, {})
+    if whole_section:
+        values = plugin.workspace()
+        changes = {"grants": values["grants"], "sceneGrants": values["sceneGrants"], **changes}
+
+    plugin.save_workspace(changes)
+
+    saved = json.loads(controller.policy_path.read_text("utf-8"))
+    assert saved[unavailable] == previous
+    if unavailable == "scenes":
+        assert saved["devices"]["lamp"] == {"mode": "read", "alias": "新别名"}
+        assert controller.tool("scene", {"scene": "h:1"})["error"]["code"] == "SCENE_NOT_ALLOWED"
+    else:
+        assert saved["scenes"] == []
+        assert controller.tool("read", {"device": "lamp"})["error"]["code"] == "DEVICE_NOT_ALLOWED"
 
 
 def test_write_readback_and_no_automatic_resend(controller):
@@ -236,7 +272,7 @@ def test_cancel_login_drops_late_credentials(tmp_path):
             entered.set()
             assert release.wait(3)
             self.persist({"userId": "late", "serviceToken": "must-not-save"})
-    c = Controller(tmp_path, cloud_factory=Delayed, logger=RecordingLogger())
+    c = Controller(tmp_path, cloud_factory=Delayed, logger=RecordingLogger(), diagnose=exception_diagnostics)
     c.start("login")
     assert entered.wait(2)
     worker = c.worker
@@ -246,6 +282,37 @@ def test_cancel_login_drops_late_credentials(tmp_path):
     assert not c.vault.exists()
     assert not c.connected and c.qr is None
     c.close()
+
+
+def test_cancelled_login_does_not_block_new_login(tmp_path):
+    entered, release, restarted = threading.Event(), threading.Event(), threading.Event()
+    class Delayed(FakeCloud):
+        attempts = 0
+        def login(self, callback):
+            type(self).attempts += 1
+            callback(b"test-qr")
+            if type(self).attempts == 1:
+                entered.set()
+                assert release.wait(3)
+                self.persist({"userId": "old", "serviceToken": "late-token"})
+            else:
+                self.persist({"userId": "new", "serviceToken": "new-token"})
+                restarted.set()
+    c = Controller(tmp_path, cloud_factory=Delayed, logger=RecordingLogger(), diagnose=exception_diagnostics)
+    try:
+        c.start("login")
+        assert entered.wait(2)
+        old = c.worker
+        c.logout()
+        c.start("login")
+        assert restarted.wait(2), "新登录不能等待已取消的扫码长轮询"
+        c.worker.join(2)
+        release.set()
+        old.join(2)
+        assert c.connected and c.vault.read()["userId"] == "new"
+    finally:
+        release.set()
+        c.close()
 
 
 def test_account_change_clears_permissions_and_logout_deletes_auth(controller):
@@ -259,7 +326,7 @@ def test_account_change_clears_permissions_and_logout_deletes_auth(controller):
 
 def test_permissions_and_credentials_survive_restart(controller):
     grant(controller)
-    c = Controller(controller.root, cloud_factory=FakeCloud, logger=RecordingLogger())
+    c = Controller(controller.root, cloud_factory=FakeCloud, logger=RecordingLogger(), diagnose=exception_diagnostics)
     try:
         c.resume()
         c.worker.join(3)
@@ -281,23 +348,50 @@ def test_busy_does_not_queue_device_writes(controller):
 def test_scene_failure_keeps_device_catalog_but_removes_stale_scene(controller):
     grant(controller, scenes=["h:1"])
     def fail():
-        raise requests.ConnectionError("do-not-expose-cookie")
+        raise requests.ConnectionError("TLS connection failed; Cookie: private-token-test")
     controller.cloud.scenes = fail
     controller.start("refresh")
     controller.worker.join(3)
     assert controller.connected and controller.devices and not controller.scenes
     assert controller.status()["sceneError"]["code"] == "NETWORK_ERROR"
     assert any(r["level"] == "error" and r["fields"].get("reason_code") == "NETWORK_ERROR" for r in controller.logger.records)
-    assert "do-not-expose-cookie" not in json.dumps(controller.logger.records)
+    assert "private-token-test" not in json.dumps(controller.logger.records)
+    assert "TLS connection failed" in json.dumps(controller.logger.records)
     assert controller.tool("scene", {"scene": "h:1"})["error"]["code"] == "SCENE_NOT_ALLOWED"
 
 
 def test_spec_preserves_action_parameter_definitions():
-    raw = {"props": {"tree": {"services": [{"iid": 2, "properties": [{"iid": 1, "type": "level", "description": "Level", "format": "uint8", "access": ["write"], "valueRange": [0, 10, 2]}], "actions": [{"iid": 1, "type": "set-level", "in": [1]}]}]}}}
+    raw = {"services": [{"iid": 2, "type": "light", "comment": "灯", "properties": [{"iid": 1, "type": "level", "description": "Level", "comment": "亮度", "format": "uint8", "access": ["write"], "value-range": [0, 10, 2]}], "actions": [{"iid": 1, "type": "set-level", "in": [1]}]}]}
     spec = parse_spec(raw)
     prop = spec["actions"][0]["inputs"][0]
     assert prop["key"] == "2.1"
     assert prop["range"] == [0, 10, 2] and prop["format"] == "uint8"
+    assert prop["description"] == "亮度" and prop["service"] == "灯"
+
+
+def test_catalog_uses_full_spec_type_and_caches_each_device_spec(monkeypatch):
+    from types import SimpleNamespace
+    from mijia_plugin import cloud
+    urn = "urn:miot-spec-v2:device:temperature-humidity-sensor:0000A00A:xiaomi-new3pr:1:0000D063"
+    client = cloud.Cloud.__new__(cloud.Cloud)
+    client.specs = {}
+    client.api = SimpleNamespace(get_homes_list=lambda: [], get_shared_devices_list=lambda: [],
+        get_devices_list=lambda: [{"did": "sensor", "name": "温湿度计", "model": "xiaomi.sensor_ht.new3pr", "spec_type": urn}])
+    device = client.catalog()["sensor"]
+    calls = []
+    def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        return SimpleNamespace(json=lambda: {"services": [{"iid": 3, "type": "environment", "comment": "环境",
+            "properties": [{"iid": 7, "type": "temperature", "comment": "温度", "format": "float", "access": ["read"],
+                "unit": "celsius", "value-range": [-50, 80, .1], "value-list": []}]}]})
+    monkeypatch.setattr(cloud._Requests, "get", fetch)
+    prop = client.spec(device)["properties"][0]
+    assert prop["key"] == "3.7" and prop["range"] == [-50, 80, .1] and prop["description"] == "温度"
+    client.spec(device)
+    client.spec({**device, "spec_type": urn + ":2"})
+    assert calls == [("https://miot-spec.org/miot-spec-v2/instance", {"params": {"type": value}}) for value in (urn, urn + ":2")]
+    with pytest.raises(PluginError, match="MIoT"):
+        client.spec({**device, "spec_type": None})
 
 
 def test_transport_sets_timeout_and_cancel_prevents_send(monkeypatch):
@@ -320,20 +414,21 @@ def test_transport_sets_timeout_and_cancel_prevents_send(monkeypatch):
     assert len(calls) == 2
 
 
-def test_upstream_errors_never_echo_secret_bodies():
+def test_upstream_errors_preserve_reason_without_credentials():
     from mijiaAPI.errors import APIError, LoginError
-    for error in [APIError(-1, "serviceToken=hidden"), LoginError(-2, "Cookie: private"), ValueError("secret-body")]:
-        public = json.dumps(public_error(error))
-        assert "hidden" not in public and "private" not in public and "secret-body" not in public
+    for error in [APIError(-1, "request denied; serviceToken=hidden"), LoginError(-2, "request denied; Cookie: private"), ValueError("request denied; ssecurity=private")]:
+        public = json.dumps(public_error(error, diagnose=exception_diagnostics))
+        assert "hidden" not in public and "private" not in public
+        assert "request denied" in public
 
 
 def test_connection_failure_is_logged_without_raw_authentication_response(tmp_path):
     from mijiaAPI.errors import APIError
     class Failed(FakeCloud):
         def login(self, callback):
-            raise APIError(-10005, "private-auth-response")
+            raise APIError(-10005, "permission denied; serviceToken=private-auth-response")
     logger = RecordingLogger()
-    c = Controller(tmp_path, cloud_factory=Failed, logger=logger)
+    c = Controller(tmp_path, cloud_factory=Failed, logger=logger, diagnose=exception_diagnostics)
     try:
         c.start("login")
         c.worker.join(3)
@@ -342,6 +437,8 @@ def test_connection_failure_is_logged_without_raw_authentication_response(tmp_pa
         assert failure["level"] == "error"
         assert failure["fields"]["serviceCode"] == "-10005"
         assert "private-auth-response" not in json.dumps(logger.records)
+        assert "permission denied" in failure["fields"]["diagnostic"]
+        assert "login" in failure["fields"]["exception_stack"]
     finally:
         c.close()
 
@@ -361,6 +458,47 @@ def test_gui_read_and_settings_failures_use_host_logger(controller):
     assert controller.logger.records[-1]["fields"]["reason_code"] == "INVALID_PERMISSIONS"
 
 
+def test_settings_error_preserves_original_cause_and_location(controller):
+    from plugin import MijiaPlugin
+    plugin = MijiaPlugin()
+    plugin.controller = controller
+    def fail(_values):
+        raise OSError(28, "No space left on device", str(controller.policy_path))
+    with pytest.raises(RuntimeError, match="No space left") as caught:
+        plugin.safe(fail)({})
+    assert caught.value.diagnostics["errno"] == 28
+    fields = controller.logger.records[-1]["fields"]
+    assert "No space left" in fields["diagnostic"]
+    assert "fail" in fields["exception_stack"]
+
+
+def test_failed_permission_save_does_not_authorize_device(controller, monkeypatch):
+    from mijia_plugin import controller as module
+    before = controller.policy_path.read_bytes()
+    def fail(*_args):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(module, "atomic_write", fail)
+    with pytest.raises(OSError):
+        grant(controller)
+    assert controller.policy_path.read_bytes() == before
+    assert controller.tool("write", {"device": "lamp", "property": "2.1", "value": True})["error"]["code"] == "DEVICE_NOT_ALLOWED"
+    assert controller.cloud.writes == []
+
+
+def test_chained_diagnostics_redact_mijia_authentication_fields():
+    from mijiaAPI.errors import LoginError
+    try:
+        try:
+            raise LoginError(-1, 'account rejected; ssecurity="private-security"')
+        except LoginError as cause:
+            raise RuntimeError("login failed") from cause
+    except RuntimeError as error:
+        problem = public_error(error, diagnose=exception_diagnostics)
+    text = json.dumps(problem)
+    assert "private-security" not in text
+    assert "account rejected" in text and "login failed" in problem["diagnostics"]["exception_chain"]
+
+
 def test_partial_read_failure_and_lifecycle_are_logged_without_poll_noise(controller):
     from plugin import MijiaPlugin
     plugin = MijiaPlugin()
@@ -368,7 +506,7 @@ def test_partial_read_failure_and_lifecycle_are_logged_without_poll_noise(contro
     assert controller.tool("status", {})["connected"] is True
     count = len(controller.logger.records)
     plugin.settings()
-    plugin.records("devices")
+    plugin.workspace()
     assert len(controller.logger.records) == count
     assert all(r["level"] == "info" for r in controller.logger.records)
     grant(controller)
@@ -378,3 +516,75 @@ def test_partial_read_failure_and_lifecycle_are_logged_without_poll_noise(contro
     failure = next(r for r in controller.logger.records if r["level"] == "error")
     assert failure["fields"] == {"property": "2.1", "service_code": -704042011}
     assert "must-not-escape" not in json.dumps(controller.logger.records)
+
+
+def test_image_loading_does_not_block_device_reads_and_logout_drops_late_images(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+
+    class DelayedImages(FakeCloud):
+        def image(self, model):
+            entered.set()
+            assert release.wait(3)
+            return "data:image/png;base64,late"
+
+    c = Controller(tmp_path, cloud_factory=DelayedImages, logger=RecordingLogger(), diagnose=exception_diagnostics)
+    try:
+        c.start("login")
+        c.worker.join(3)
+        assert entered.wait(3)
+        assert c.read_for_user("lamp")["rows"]
+        c.logout()
+        release.set()
+        c.image_worker.join(3)
+        assert c.images == {} and not c.snapshot()["devices"]
+    finally:
+        release.set()
+        c.close()
+
+
+def test_product_images_are_cached_by_model_and_use_a_separate_download(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from mijia_plugin import cloud
+
+    calls = []
+    class Session:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return SimpleNamespace(status_code=302, headers={"Location": "https://cdn.example/lamp.png"})
+
+    client = cloud.Cloud.__new__(cloud.Cloud)
+    client.image_root = tmp_path / "images"
+    client.api = SimpleNamespace(_refresh_token=lambda: None, auth_data={"ssecurity": "secret"}, session=Session(), api_base_url="https://api.example/app")
+    monkeypatch.setattr(cloud, "get_signed_nonce", lambda *_: "signed")
+    monkeypatch.setattr(cloud, "generate_enc_params", lambda *args: args[4])
+    downloads = []
+    def download(url):
+        downloads.append(url)
+        return SimpleNamespace(headers={"Content-Type": "image/png"}, content=b"image-bytes")
+    monkeypatch.setattr(cloud._Requests, "get", download)
+    value = client.image("vendor.light.v1")
+    assert value.startswith("data:image/png;base64,")
+    assert json.loads(calls[0][1]["data"]["data"]) == {"icon_name": "icon_real", "model": "vendor.light.v1"}
+    assert calls[0][1]["allow_redirects"] is False
+    client.api = None
+    assert client.image("vendor.light.v1") == value
+    assert downloads == ["https://cdn.example/lamp.png"]
+
+
+def test_image_failure_keeps_catalog_permissions_and_state_reading(tmp_path):
+    class NoImages(FakeCloud):
+        def image(self, model):
+            raise requests.Timeout()
+
+    c = Controller(tmp_path, cloud_factory=NoImages, logger=RecordingLogger(), diagnose=exception_diagnostics)
+    try:
+        c.start("login")
+        c.worker.join(3)
+        c.image_worker.join(3)
+        grant(c, "read")
+        assert c.status()["error"] is None
+        assert len(c.snapshot()["devices"]) == 2
+        assert c.tool("read", {"device": "lamp"})["properties"][0]["value"] is False
+        assert any(record["level"] == "warning" for record in c.logger.records)
+    finally:
+        c.close()

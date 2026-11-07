@@ -14,6 +14,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--sakura", required=True, type=Path)
+parser.add_argument("--app-version", help="仅为隔离测试目录指定宿主版本")
 parser.add_argument("--live-qr", action="store_true", help="在临时账号根验证真实二维码，不扫码登录")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
@@ -47,14 +48,17 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
     work = Path(temporary)
     distribution = work / "distribution"
     (distribution / "plugins/builtin").mkdir(parents=True)
-    shutil.copy2(args.sakura / "VERSION", distribution / "VERSION")
+    if args.app_version:
+        (distribution / "VERSION").write_text(args.app_version, encoding="utf-8")
+    else:
+        shutil.copy2(args.sakura / "VERSION", distribution / "VERSION")
     uv_dir = distribution / "python/tools"
     uv_dir.mkdir(parents=True)
     uv_name = "uv.exe" if os.name == "nt" else "uv"
     uv_source = args.sakura / "runtime" / ("Scripts" if os.name == "nt" else "bin") / uv_name
     shutil.copy2(uv_source, uv_dir / uv_name)
     roots = RuntimeRoots(distribution, work / "user")
-    record = LocalPluginInstaller(roots).install(root / "dist/Sakura-Mijia-0.3.1.sakplugin.zip", "zip", initial_enabled=True)
+    record = LocalPluginInstaller(roots).install(root / "dist/Sakura-Mijia-0.3.2.sakplugin.zip", "zip", initial_enabled=True)
     registry = ToolRegistry()
     log_output = LogOutput()
     bridge = install_runtime_logging(log_output)
@@ -77,10 +81,11 @@ with tempfile.TemporaryDirectory(prefix="sakura-mijia-host-") as temporary:
         item = next(p for p in snapshot["plugins"] if p["pluginId"] == "dev.sakura.mijia")
         assert item["state"] == "active" and item["sections"]
         sections = {s['sectionId']: s for s in item['sections']}
-        assert set(sections) == {'connection', 'devices', 'scenes'}
+        assert set(sections) == {'connection', 'workspace'}
         assert all(s['reasonCode'] == 'READY' for s in sections.values()), sections
         assert sections['connection']['fields'][1]['type'] == 'image'
-        assert sections['devices']['presentation']['component'] == 'record-table'
+        assert sections['workspace']['presentation']['component'] == 'module'
+        assert sections['workspace']['values']['visible'] is False
         if args.live_qr:
             host.settings_action('dev.sakura.mijia', 'connection', 'login', {})
             deadline = time.monotonic() + 40
